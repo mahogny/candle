@@ -133,6 +133,66 @@ pub fn call_im2col_strided(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn call_im2col3d_strided(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    (d_k, h_k, w_k): (usize, usize, usize),
+    stride: [usize; 3],
+    padding: [usize; 3],
+    dilation: [usize; 3],
+    input: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+
+    let d = shape[2];
+    let h = shape[3];
+    let w = shape[4];
+    let d_out = (d + 2 * padding[0] - dilation[0] * (d_k - 1) - 1) / stride[0] + 1;
+    let h_out = (h + 2 * padding[1] - dilation[1] * (h_k - 1) - 1) / stride[1] + 1;
+    let w_out = (w + 2 * padding[2] - dilation[2] * (w_k - 1) - 1) / stride[2] + 1;
+
+    let dst_el = shape[0] * d_out * h_out * w_out * shape[1] * d_k * h_k * w_k;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "im2col3d {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            d_out,
+            h_out,
+            w_out,
+            d_k,
+            h_k,
+            w_k,
+            stride[0],
+            stride[1],
+            stride[2],
+            padding[0],
+            padding[1],
+            padding[2],
+            dilation[0],
+            dilation[1],
+            dilation[2],
+            shape,
+            strides,
+            &input,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn call_upsample_nearest_2d(
     device: &Device,
     ep: impl EncoderProvider,
