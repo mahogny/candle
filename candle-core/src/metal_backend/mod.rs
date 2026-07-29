@@ -1193,12 +1193,84 @@ impl BackendStorage for MetalStorage {
 
     fn conv3d(
         &self,
-        _layout: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &ParamsConv3D,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &ParamsConv3D,
     ) -> Result<Self> {
-        crate::bail!("conv3d is not implemented for the metal backend")
+        let device = self.device().clone();
+        let dims = layout.shape().dims();
+
+        let d_k = params.k_d;
+        let h_k = params.k_h;
+        let w_k = params.k_w;
+        let d_out = params.out_d();
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let dst_el = dims[0] * d_out * h_out * w_out * dims[1] * d_k * h_k * w_k;
+
+        let dst = self
+            .device
+            .new_buffer(dst_el, self.dtype, "conv3d_im2col")?;
+        let encoder = self.device.command_encoder()?;
+        encoder.set_label("conv3d_im2col");
+        let name = match self.dtype {
+            DType::F32 => "im2col3d_f32",
+            DType::F16 => "im2col3d_f16",
+            DType::BF16 => "im2col3d_bf16",
+            DType::U8 => "im2col3d_u8",
+            DType::U32 => "im2col3d_u32",
+            dtype => crate::bail!("Metal conv3d {dtype:?} not implemented"),
+        };
+        let src = buffer_o(&self.buffer, layout, self.dtype);
+        candle_metal_kernels::call_im2col3d_strided(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            name,
+            layout.shape().dims(),
+            layout.stride(),
+            (d_k, h_k, w_k),
+            params.stride,
+            params.padding,
+            params.dilation,
+            src,
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        drop(encoder);
+
+        let col = Self {
+            buffer: dst,
+            device,
+            count: dst_el,
+            dtype: self.dtype,
+        };
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_d * params.k_h * params.k_w * params.c_in;
+        let m = d_out * h_out * w_out;
+        let col_l = Layout::contiguous((b, m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+                .transpose(1, 2)?
+                .broadcast_as((b, k, n))?;
+            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+        } else {
+            let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l = Layout::contiguous((1, n, k))
+                .transpose(1, 2)?
+                .broadcast_as((b, k, n))?;
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
+        };
+        let res_l = Layout::contiguous((b, d_out, h_out, w_out, n))
+            .transpose(3, 4)?
+            .transpose(2, 3)?
+            .transpose(1, 2)?;
+        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
     }
 
     fn conv_transpose2d(

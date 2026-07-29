@@ -1271,6 +1271,16 @@ fn conv3d_cuda_plan_cases() -> Result<()> {
     conv3d_plan_cases(&dev)
 }
 
+#[cfg(feature = "metal")]
+#[test]
+fn conv3d_metal_plan_cases() -> Result<()> {
+    if !candle_core::utils::metal_is_available() {
+        return Ok(());
+    }
+    let dev = Device::new_metal(0)?;
+    conv3d_plan_cases(&dev)
+}
+
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
 test_device!(
     conv1d_small,
