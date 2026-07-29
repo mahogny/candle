@@ -358,12 +358,26 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                 let dim_m1 = dims[dims.len() - 1];
                 let (n_rows, n_cols) = (el / dim_m1, dim_m1);
 
-                let cfg = LaunchConfig {
-                    grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (1, 32, 1),
-                    shared_mem_bytes: 0,
+                let (kernel, cfg) = if T::DTYPE == DType::F32 && n_cols == 1024 {
+                    (
+                        kernel_name::<T>("softmax_1024"),
+                        LaunchConfig {
+                            grid_dim: (n_rows as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                    )
+                } else {
+                    (
+                        kernel_name::<T>("softmax"),
+                        LaunchConfig {
+                            grid_dim: (n_rows as u32, 1, 1),
+                            block_dim: (1, 32, 1),
+                            shared_mem_bytes: 0,
+                        },
+                    )
                 };
-                let func = dev.get_or_load_func(&kernel_name::<T>("softmax"), &kernels::REDUCE)?;
+                let func = dev.get_or_load_func(&kernel, &kernels::REDUCE)?;
                 // SAFETY: Set later by running the kernel.
                 let dst = unsafe { dev.alloc::<T>(el)? };
                 let mut builder = func.builder();
@@ -1324,4 +1338,43 @@ pub fn sdpa(
             do_causal,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::softmax_last_dim;
+    use candle::{Device, Result, Tensor, D};
+
+    fn softmax_last_dim_1024_f32(device: &Device) -> Result<()> {
+        let data: Vec<_> = (0..3 * 1024)
+            .map(|i| ((i * 37 % 251) as f32 - 125.) / 17.)
+            .collect();
+        let xs = Tensor::from_vec(data, (3, 1024), device)?;
+        let actual = softmax_last_dim(&xs)?;
+        let max = xs.max_keepdim(D::Minus1)?;
+        let exp = xs.broadcast_sub(&max)?.exp()?;
+        let expected = exp.broadcast_div(&exp.sum_keepdim(D::Minus1)?)?;
+        let max_diff = (actual - expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .reshape(())?
+            .to_vec0::<f32>()?;
+        assert!(max_diff < 1e-6, "max_diff {max_diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn softmax_last_dim_1024_f32_cpu() -> Result<()> {
+        softmax_last_dim_1024_f32(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn softmax_last_dim_1024_f32_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        softmax_last_dim_1024_f32(&device)
+    }
 }
