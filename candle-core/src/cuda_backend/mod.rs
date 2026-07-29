@@ -2272,7 +2272,24 @@ impl BackendStorage for CudaStorage {
             (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
-                let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
+                let collapsed_lhs;
+                let cfg = {
+                    let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
+                    let lhs_stride = lhs_l.stride();
+                    let can_collapse_broadcast_rhs = b > 1
+                        && cfg.stride_a == 0
+                        && cfg.stride_b == (m * k) as i64
+                        && lhs_l.start_offset() == 0
+                        && lhs_stride.len() >= 2
+                        && lhs_stride[lhs_stride.len() - 1] == 1
+                        && lhs_stride[lhs_stride.len() - 2] == k;
+                    if can_collapse_broadcast_rhs {
+                        collapsed_lhs = Layout::contiguous((1, b * m, k));
+                        gemm_config(1., 0., (1, b * m, n, k), &collapsed_lhs, rhs_l)?
+                    } else {
+                        cfg
+                    }
+                };
                 let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
                 unsafe { gemm_strided_batched_f32(&self.device.blas, cfg, rhs, lhs, &mut out) }
                     .w()?;
@@ -2579,11 +2596,11 @@ unsafe fn gemm_strided_batched_f32(
     use cudarc::cublas::sys;
     use cudarc::driver::DevicePtrMut;
 
-    let compute_type = if gemm_reduced_precision_f32() {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
-    } else {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
-    };
+    if !gemm_reduced_precision_f32() {
+        return cublas.gemm_strided_batched(cfg, a, b, c);
+    }
+
+    let compute_type = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32;
     let alpha = &cfg.gemm.alpha as *const f32 as *const _;
     let beta = &cfg.gemm.beta as *const f32 as *const _;
 
@@ -2735,4 +2752,39 @@ unsafe fn gemm_strided_batched_bf16(
         compute_type,
         sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Device, IndexOp, Result, Tensor};
+
+    #[test]
+    fn f32_matmul_broadcast_rhs_batch_stride_zero() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let lhs_data: Vec<_> = (0..8 * 4 * 5)
+            .map(|i| (i as f32 % 17.) * 0.125 - 1.)
+            .collect();
+        let rhs_data: Vec<_> = (0..5 * 3).map(|i| (i as f32 % 11.) * 0.25 - 0.75).collect();
+        let lhs = Tensor::from_vec(lhs_data, (8, 4, 5), &device)?;
+        let rhs = Tensor::from_vec(rhs_data, (1, 5, 3), &device)?;
+
+        let out = lhs.broadcast_matmul(&rhs)?;
+        assert_eq!(out.dims(), &[8, 4, 3]);
+
+        for batch_idx in 0..8 {
+            let actual = out.i(batch_idx)?;
+            let expected = lhs.i(batch_idx)?.matmul(&rhs.i(0)?)?;
+            let max_diff = (actual - expected)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .reshape(())?
+                .to_vec0::<f32>()?;
+            assert!(max_diff < 1e-5, "batch {batch_idx} max_diff {max_diff}");
+        }
+
+        Ok(())
+    }
 }
