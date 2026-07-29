@@ -69,6 +69,91 @@ METAL_FUNC void im2col(
 }
 
 template <typename T>
+METAL_FUNC void im2col3d(
+    constant size_t &dst_numel,
+    constant size_t &d_out,
+    constant size_t &h_out,
+    constant size_t &w_out,
+    constant size_t &d_k,
+    constant size_t &h_k,
+    constant size_t &w_k,
+    constant size_t &d_stride,
+    constant size_t &h_stride,
+    constant size_t &w_stride,
+    constant size_t &d_padding,
+    constant size_t &h_padding,
+    constant size_t &w_padding,
+    constant size_t &d_dilation,
+    constant size_t &h_dilation,
+    constant size_t &w_dilation,
+    constant size_t *src_dims,
+    constant size_t *src_strides,
+    device const T *src,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  // dst: (b_size, d_out, h_out, w_out, c_in, d_k, h_k, w_k)
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  if (tid >= dst_numel) {
+    return;
+  }
+  const size_t c_in = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+
+  const size_t dst_s6 = w_k;
+  const size_t dst_s5 = h_k * dst_s6;
+  const size_t dst_s4 = d_k * dst_s5;
+  const size_t dst_s3 = c_in * dst_s4;
+  const size_t dst_s2 = w_out * dst_s3;
+  const size_t dst_s1 = h_out * dst_s2;
+  const size_t dst_s0 = d_out * dst_s1;
+
+  size_t tmp_tid = tid;
+  const size_t b_idx = tmp_tid / dst_s0;
+  tmp_tid -= b_idx * dst_s0;
+  const size_t d_idx = tmp_tid / dst_s1;
+  tmp_tid -= d_idx * dst_s1;
+  const size_t h_idx = tmp_tid / dst_s2;
+  tmp_tid -= h_idx * dst_s2;
+  const size_t w_idx = tmp_tid / dst_s3;
+  tmp_tid -= w_idx * dst_s3;
+  const size_t c_idx = tmp_tid / dst_s4;
+  tmp_tid -= c_idx * dst_s4;
+  const size_t d_k_idx = tmp_tid / dst_s5;
+  tmp_tid -= d_k_idx * dst_s5;
+  const size_t h_k_idx = tmp_tid / dst_s6;
+  tmp_tid -= h_k_idx * dst_s6;
+  const size_t w_k_idx = tmp_tid;
+
+  size_t src_d_idx = d_idx * d_stride + d_k_idx * d_dilation;
+  size_t src_h_idx = h_idx * h_stride + h_k_idx * h_dilation;
+  size_t src_w_idx = w_idx * w_stride + w_k_idx * w_dilation;
+  if (src_d_idx < d_padding || src_d_idx >= d_in + d_padding) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else if (src_h_idx < h_padding || src_h_idx >= h_in + h_padding) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else if (src_w_idx < w_padding || src_w_idx >= w_in + w_padding) {
+    dst[tid] = static_cast<T>(0);
+  }
+  else {
+    src_d_idx -= d_padding;
+    src_h_idx -= h_padding;
+    src_w_idx -= w_padding;
+    const size_t src_i =
+      b_idx * src_strides[0]
+      + c_idx * src_strides[1]
+      + src_d_idx * src_strides[2]
+      + src_h_idx * src_strides[3]
+      + src_w_idx * src_strides[4];
+    dst[tid] = src[src_i];
+  }
+}
+
+template <typename T>
 METAL_FUNC void col2im1d(
     constant size_t &dst_el,
     constant size_t &l_out,
@@ -300,6 +385,36 @@ kernel void FN_NAME(  \
     uint tid [[ thread_position_in_grid ]] \
 ) {  \
   im2col<T>(dst_numel, h_out, w_out, h_k, w_k, stride, padding, dilation, src_dims, src_strides, src, dst, tid); \
+} \
+
+#define IM2COL3D_OP(T, FN_NAME) \
+kernel void FN_NAME(  \
+    constant size_t &dst_numel, \
+    constant size_t &d_out, \
+    constant size_t &h_out, \
+    constant size_t &w_out, \
+    constant size_t &d_k, \
+    constant size_t &h_k, \
+    constant size_t &w_k, \
+    constant size_t &d_stride, \
+    constant size_t &h_stride, \
+    constant size_t &w_stride, \
+    constant size_t &d_padding, \
+    constant size_t &h_padding, \
+    constant size_t &w_padding, \
+    constant size_t &d_dilation, \
+    constant size_t &h_dilation, \
+    constant size_t &w_dilation, \
+    constant size_t *src_dims, \
+    constant size_t *src_strides, \
+    device const T *src, \
+    device T *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) {  \
+  im2col3d<T>( \
+      dst_numel, d_out, h_out, w_out, d_k, h_k, w_k, d_stride, h_stride, w_stride, \
+      d_padding, h_padding, w_padding, d_dilation, h_dilation, w_dilation, src_dims, \
+      src_strides, src, dst, tid); \
 } \
 
 #define IM2COL1D_OP(T, FN_NAME) \
@@ -652,6 +767,14 @@ IM2COL_OP(uint8_t, im2col_u8)
 IM2COL_OP(uint32_t, im2col_u32)
 #if defined(__HAVE_BFLOAT__)
 IM2COL_OP(bfloat, im2col_bf16)
+#endif
+
+IM2COL3D_OP(float, im2col3d_f32)
+IM2COL3D_OP(half, im2col3d_f16)
+IM2COL3D_OP(uint8_t, im2col3d_u8)
+IM2COL3D_OP(uint32_t, im2col3d_u32)
+#if defined(__HAVE_BFLOAT__)
+IM2COL3D_OP(bfloat, im2col3d_bf16)
 #endif
 
 COL2IM1D_OP(float, col2im1d_f32)
