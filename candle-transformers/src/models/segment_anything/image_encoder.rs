@@ -468,7 +468,7 @@ impl Module for ImageEncoderViT {
         let _enter = self.span.enter();
         let xs = self.patch_embed.forward(xs)?;
         let mut xs = match &self.pos_embed {
-            Some(pos_embed) => (xs + pos_embed)?,
+            Some(pos_embed) => xs.broadcast_add(pos_embed)?,
             None => xs,
         };
         for block in self.blocks.iter() {
@@ -479,5 +479,61 @@ impl Module for ImageEncoderViT {
             .apply(&self.neck_ln1)?
             .apply(&self.neck_conv2)?
             .apply(&self.neck_ln2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImageEncoderViT;
+    use candle::{DType, Device, Result, Tensor};
+    use candle_nn::{Module, VarBuilder};
+
+    fn image_encoder_abs_pos_supports_batched_inputs(device: &Device) -> Result<()> {
+        let img_size = 8;
+        let patch_size = 4;
+        let in_chans = 3;
+        let embed_dim = 4;
+        let out_chans = 2;
+        let vb = VarBuilder::zeros(DType::F32, device);
+        let encoder = ImageEncoderViT::new(
+            img_size,
+            patch_size,
+            in_chans,
+            embed_dim,
+            0,
+            1,
+            out_chans,
+            true,
+            false,
+            true,
+            0,
+            &[],
+            vb,
+        )?;
+        let xs = Tensor::zeros((2, in_chans, img_size, img_size), DType::F32, device)?;
+        let ys = encoder.forward(&xs)?;
+        assert_eq!(
+            ys.dims(),
+            &[2, out_chans, img_size / patch_size, img_size / patch_size]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_encoder_abs_pos_supports_batched_inputs_cpu() -> Result<()> {
+        image_encoder_abs_pos_supports_batched_inputs(&Device::Cpu)
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn image_encoder_abs_pos_supports_batched_inputs_cuda() -> Result<()> {
+        let device = match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("skipping CUDA test: {err}");
+                return Ok(());
+            }
+        };
+        image_encoder_abs_pos_supports_batched_inputs(&device)
     }
 }
