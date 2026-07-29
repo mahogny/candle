@@ -1099,10 +1099,7 @@ fn assert_vec_close(left: &[f32], right: &[f32], max_abs: f32) {
     assert!(diff <= max_abs, "max_abs={diff} > {max_abs}");
 }
 
-#[test]
-fn conv3d_cpu_plan_cases() -> Result<()> {
-    let dev = &Device::Cpu;
-
+fn conv3d_plan_cases(dev: &Device) -> Result<()> {
     let input = (0..8).map(|v| v as f32).collect::<Vec<_>>();
     let kernel = vec![2.];
     let res = Tensor::new(input.clone(), dev)?
@@ -1258,6 +1255,20 @@ fn conv3d_cpu_plan_cases() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn conv3d_cpu_plan_cases() -> Result<()> {
+    conv3d_plan_cases(&Device::Cpu)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn conv3d_cuda_plan_cases() -> Result<()> {
+    let Ok(dev) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    conv3d_plan_cases(&dev)
 }
 
 test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
