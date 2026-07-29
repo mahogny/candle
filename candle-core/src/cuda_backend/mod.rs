@@ -294,6 +294,72 @@ impl Map1 for Im2Col {
     }
 }
 
+#[allow(unused)]
+struct Im2Col3D {
+    d_k: usize,
+    h_k: usize,
+    w_k: usize,
+    stride: [usize; 3],
+    dilation: [usize; 3],
+    padding: [usize; 3],
+}
+
+impl Im2Col3D {
+    #[allow(unused)]
+    fn dhw_out(&self, d: usize, h: usize, w: usize) -> (usize, usize, usize) {
+        let d_out =
+            (d + 2 * self.padding[0] - self.dilation[0] * (self.d_k - 1) - 1) / self.stride[0] + 1;
+        let h_out =
+            (h + 2 * self.padding[1] - self.dilation[1] * (self.h_k - 1) - 1) / self.stride[1] + 1;
+        let w_out =
+            (w + 2 * self.padding[2] - self.dilation[2] * (self.w_k - 1) - 1) / self.stride[2] + 1;
+        (d_out, h_out, w_out)
+    }
+}
+
+impl Map1 for Im2Col3D {
+    fn f<T: DeviceRepr + WithDType>(
+        &self,
+        src: &CudaSlice<T>,
+        dev: &CudaDevice,
+        layout: &Layout,
+    ) -> Result<CudaSlice<T>> {
+        let shape = layout.shape();
+        let dims = shape.dims();
+        let (d_out, h_out, w_out) = self.dhw_out(dims[2], dims[3], dims[4]);
+        let dst_el = dims[0] * d_out * h_out * w_out * dims[1] * self.d_k * self.h_k * self.w_k;
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let ds = SlicePtrOrNull::params_from_vec(dev, [dims, layout.stride()].concat())?;
+        let src = &src.slice(layout.start_offset()..);
+        let func = dev.get_or_load_func(&kernel_name::<T>("im2col3d"), &kernels::CONV)?;
+        // SAFETY: Set later by running the kernel.
+        let dst = unsafe { dev.alloc::<T>(dst_el)? };
+        let mut builder = func.builder();
+        barg!(builder, dst_el);
+        barg!(builder, d_out);
+        barg!(builder, h_out);
+        barg!(builder, w_out);
+        barg!(builder, self.d_k);
+        barg!(builder, self.h_k);
+        barg!(builder, self.w_k);
+        barg!(builder, self.stride[0]);
+        barg!(builder, self.stride[1]);
+        barg!(builder, self.stride[2]);
+        barg!(builder, self.padding[0]);
+        barg!(builder, self.padding[1]);
+        barg!(builder, self.padding[2]);
+        barg!(builder, self.dilation[0]);
+        barg!(builder, self.dilation[1]);
+        barg!(builder, self.dilation[2]);
+        ds.builder_arg(&mut builder);
+        builder.arg(src);
+        builder.arg(&dst);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(dst)
+    }
+}
+
 struct Powf(f64);
 impl Map1 for Powf {
     fn f<T: DeviceRepr + WithDType>(
@@ -2111,14 +2177,131 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    #[cfg(not(feature = "cudnn"))]
     fn conv3d(
         &self,
-        _l: &Layout,
-        _kernel: &Self,
-        _kernel_l: &Layout,
-        _params: &crate::conv::ParamsConv3D,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv3D,
     ) -> Result<Self> {
-        crate::bail!("conv3d is not implemented for the cuda backend")
+        let device = self.device().clone();
+        let col = Im2Col3D {
+            d_k: params.k_d,
+            h_k: params.k_h,
+            w_k: params.k_w,
+            stride: params.stride,
+            dilation: params.dilation,
+            padding: params.padding,
+        }
+        .map(&self.slice, &device, l)?;
+        let col = Self { slice: col, device };
+        let d_out = params.out_d();
+        let h_out = params.out_h();
+        let w_out = params.out_w();
+        let b = params.b_size;
+        let n = params.c_out;
+        let k = params.k_d * params.k_h * params.k_w * params.c_in;
+        let m = d_out * h_out * w_out;
+        let col_l = Layout::contiguous((b * m, k));
+        let res = if kernel_l.is_contiguous() {
+            let kernel_l =
+                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+        } else {
+            // Make the kernel contiguous if not already the case.
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            let kernel_l = Layout::contiguous((n, k)).transpose(0, 1)?;
+            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
+        };
+        let res_l = Layout::contiguous((b, d_out, h_out, w_out, n))
+            .transpose(3, 4)?
+            .transpose(2, 3)?
+            .transpose(1, 2)?;
+        let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+        res.copy_strided_src(&mut res_t, 0, &res_l)?;
+        Ok(res_t)
+    }
+
+    #[cfg(feature = "cudnn")]
+    fn conv3d(
+        &self,
+        inp_l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        if !kernel_l.is_contiguous() {
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            return self.conv3d(
+                inp_l,
+                &kernel_c,
+                &Layout::contiguous(kernel_l.shape()),
+                params,
+            );
+        }
+        let dst_el =
+            params.c_out * params.out_d() * params.out_h() * params.out_w() * params.b_size;
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::U8(inp), S::U8(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                crate::cudnn::launch_conv3d::<u8, u8>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::U8(out)
+            }
+            (S::BF16(inp), S::BF16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                crate::cudnn::launch_conv3d::<bf16, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::BF16(out)
+            }
+            (S::F16(inp), S::F16(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f16, f16>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F16(out)
+            }
+            (S::F32(inp), S::F32(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f32, f32>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F32(out)
+            }
+            (S::F64(inp), S::F64(k)) => {
+                let inp = &inp.slice(inp_l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                crate::cudnn::launch_conv3d::<f64, f64>(inp, inp_l, k, &mut out, params, &device)
+                    .map_err(crate::Error::wrap)?;
+                S::F64(out)
+            }
+            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError("conv3d does not support u32"))?,
+            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError("conv3d does not support i16"))?,
+            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError("conv3d does not support i32"))?,
+            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError("conv3d does not support i64"))?,
+            (S::F8E4M3(_), S::F8E4M3(_)) => {
+                Err(CudaError::InternalError("conv3d does not support f8e4m3"))?
+            }
+            _ => Err(CudaError::InternalError("dtype mismatch in conv3d"))?,
+        };
+        Ok(Self { slice, device })
     }
 
     fn conv_transpose2d(
