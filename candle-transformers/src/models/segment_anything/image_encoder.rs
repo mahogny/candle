@@ -1,5 +1,72 @@
 use candle::{DType, IndexOp, Result, Tensor};
 use candle_nn::{layer_norm, LayerNorm, Module, VarBuilder};
+use std::time::Instant;
+
+#[derive(Clone, Debug, Default)]
+pub struct ImageEncoderViTTiming {
+    pub patch_embed_s: f64,
+    pub pos_embed_s: f64,
+    pub blocks_s: f64,
+    pub neck_s: f64,
+    pub total_s: f64,
+    pub blocks: Vec<BlockTiming>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BlockTiming {
+    pub norm1_s: f64,
+    pub partition_s: f64,
+    pub attention_s: f64,
+    pub unpartition_s: f64,
+    pub residual_s: f64,
+    pub norm2_s: f64,
+    pub mlp_lin1_s: f64,
+    pub mlp_lin1_matmul_s: f64,
+    pub mlp_lin1_bias_s: f64,
+    pub mlp_activation_s: f64,
+    pub mlp_lin2_s: f64,
+    pub mlp_lin2_matmul_s: f64,
+    pub mlp_lin2_bias_s: f64,
+    pub mlp_residual_s: f64,
+    pub norm2_mlp_s: f64,
+    pub total_s: f64,
+    pub attention: AttentionTiming,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AttentionTiming {
+    pub qkv_s: f64,
+    pub qkv_matmul_s: f64,
+    pub qkv_bias_s: f64,
+    pub qk_matmul_s: f64,
+    pub rel_pos_s: f64,
+    pub softmax_s: f64,
+    pub av_matmul_s: f64,
+    pub proj_s: f64,
+    pub proj_matmul_s: f64,
+    pub proj_bias_s: f64,
+    pub total_s: f64,
+}
+
+fn sync_for_timing(xs: &Tensor) -> Result<()> {
+    xs.device().synchronize()
+}
+
+fn timed_linear(
+    linear: &super::Linear,
+    xs: &Tensor,
+    total_s: &mut f64,
+    matmul_s: &mut f64,
+    bias_s: &mut f64,
+) -> Result<Tensor> {
+    let start = Instant::now();
+    let ys = linear.forward(xs)?;
+    sync_for_timing(&ys)?;
+    *total_s += start.elapsed().as_secs_f64();
+    *matmul_s = 0.0;
+    *bias_s = 0.0;
+    Ok(ys)
+}
 
 #[derive(Debug)]
 struct PatchEmbed {
@@ -98,6 +165,127 @@ impl candle::CustomOp3 for Add3 {
     }
 }
 
+#[cfg(feature = "cuda")]
+struct Add3Inplace(usize, usize, usize, usize, usize);
+
+#[cfg(feature = "cuda")]
+impl candle::InplaceOp3 for Add3Inplace {
+    fn name(&self) -> &'static str {
+        "add3-inplace"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &mut candle::CpuStorage,
+        _l1: &candle::Layout,
+        _s2: &candle::CpuStorage,
+        _l2: &candle::Layout,
+        _s3: &candle::CpuStorage,
+        _l3: &candle::Layout,
+    ) -> Result<()> {
+        candle::bail!("add3-inplace is only implemented for cuda")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &mut candle::CudaStorage,
+        l1: &candle::Layout,
+        s2: &candle::CudaStorage,
+        l2: &candle::Layout,
+        s3: &candle::CudaStorage,
+        l3: &candle::Layout,
+    ) -> Result<()> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle::cuda_backend::cudarc::nvrtc;
+        use candle::cuda_backend::{CudaStorageSlice, WrapErr};
+
+        const MODULE_NAME: &str = "sam_add3_inplace_f32";
+        const FUNC_NAME: &str = "sam_add3_inplace_f32";
+        const CUDA_SRC: &str = r#"
+extern "C" __global__ void sam_add3_inplace_f32(
+    float* __restrict__ attn,
+    const float* __restrict__ rel_h,
+    const float* __restrict__ rel_w,
+    unsigned long long elem_count,
+    unsigned int kh,
+    unsigned int kw) {
+    unsigned long long idx = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    if (idx >= elem_count) {
+        return;
+    }
+
+    unsigned int w = idx % kw;
+    unsigned int h = (idx / kw) % kh;
+    unsigned long long q_idx = idx / ((unsigned long long)kh * kw);
+    attn[idx] += rel_h[q_idx * kh + h] + rel_w[q_idx * kw + w];
+}
+"#;
+
+        let Add3Inplace(b, q_h, q_w, k_h, k_w) = *self;
+        let expected_attn = b * q_h * q_w * k_h * k_w;
+        let expected_rel_h = b * q_h * q_w * k_h;
+        let expected_rel_w = b * q_h * q_w * k_w;
+        if l1.shape().elem_count() != expected_attn
+            || l2.shape().elem_count() != expected_rel_h
+            || l3.shape().elem_count() != expected_rel_w
+        {
+            candle::bail!(
+                "unexpected add3 shapes {:?} {:?} {:?} for dims ({b}, {q_h}, {q_w}, {k_h}, {k_w})",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+
+        let attn = s1.as_cuda_slice::<f32>()?;
+        let attn = match l1.contiguous_offsets() {
+            None => candle::bail!("attn input has to be contiguous"),
+            Some((o1, o2)) => attn.slice(o1..o2),
+        };
+        let (rel_h, rel_w) = match (&s2.slice, &s3.slice) {
+            (CudaStorageSlice::F32(rel_h), CudaStorageSlice::F32(rel_w)) => (rel_h, rel_w),
+            _ => candle::bail!(
+                "unsupported dtype for cuda add3-inplace {:?} {:?} {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype()
+            ),
+        };
+        let rel_h = match l2.contiguous_offsets() {
+            None => candle::bail!("rel_h input has to be contiguous"),
+            Some((o1, o2)) => rel_h.slice(o1..o2),
+        };
+        let rel_w = match l3.contiguous_offsets() {
+            None => candle::bail!("rel_w input has to be contiguous"),
+            Some((o1, o2)) => rel_w.slice(o1..o2),
+        };
+
+        static PTX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+        let dev = s1.device();
+        let ptx = match PTX.get() {
+            Some(ptx) => ptx,
+            None => {
+                let ptx = nvrtc::compile_ptx(CUDA_SRC).w()?.to_src();
+                let _ = PTX.set(ptx);
+                PTX.get()
+                    .expect("PTX cache must be initialized after successful compilation")
+            }
+        };
+        let func = dev.get_or_load_custom_func(FUNC_NAME, MODULE_NAME, ptx)?;
+        let cfg = LaunchConfig::for_num_elems(expected_attn as u32);
+        let mut builder = func.builder();
+        builder.arg(&attn);
+        builder.arg(&rel_h);
+        builder.arg(&rel_w);
+        candle::builder_arg!(builder, expected_attn as u64, k_h as u32, k_w as u32);
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct Attention {
     qkv: super::Linear,
@@ -174,9 +362,19 @@ impl Attention {
                     let op = Add3(b, q_h, q_w, k_h, k_w);
                     attn.apply_op3_no_bwd(&rel_h, &rel_w, &op)
                 } else {
-                    (attn.reshape((b, q_h, q_w, k_h, k_w))?
-                        + rel_h.unsqueeze(4)?.broadcast_add(&rel_w.unsqueeze(3)?)?)?
-                    .reshape((b, q_h * q_w, k_h * k_w))
+                    #[cfg(feature = "cuda")]
+                    if attn.device().is_cuda() {
+                        let attn = attn.reshape((b, q_h, q_w, k_h, k_w))?;
+                        let op = Add3Inplace(b, q_h, q_w, k_h, k_w);
+                        attn.inplace_op3(&rel_h, &rel_w, &op)?;
+                        return attn.reshape((b, q_h * q_w, k_h * k_w));
+                    }
+                    let attn = attn.reshape((b, q_h, q_w, k_h, k_w))?;
+                    (attn + rel_h.unsqueeze(4)?.broadcast_add(&rel_w.unsqueeze(3)?)?)?.reshape((
+                        b,
+                        q_h * q_w,
+                        k_h * k_w,
+                    ))
                 }
             }
             None => Ok(attn),
@@ -211,38 +409,121 @@ fn get_rel_pos(q_size: usize, k_size: usize, rel_pos: &Tensor) -> Result<Tensor>
 
 impl Module for Attention {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_impl(xs, None)
+    }
+}
+
+impl Attention {
+    fn forward_with_timing(&self, xs: &Tensor, timing: &mut AttentionTiming) -> Result<Tensor> {
+        self.forward_impl(xs, Some(timing))
+    }
+
+    fn forward_impl(
+        &self,
+        xs: &Tensor,
+        mut timing: Option<&mut AttentionTiming>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let total_start = Instant::now();
         let (b, h, w, c) = xs.dims4()?;
-        let qkv = self
-            .qkv
-            .forward(&xs.flatten_to(1)?)?
-            .reshape((b, h * w, 3, self.num_heads, c / self.num_heads))?
-            .permute((2, 0, 3, 1, 4))?
-            .reshape((3, b * self.num_heads, h * w, c / self.num_heads))?;
+        let t0 = Instant::now();
+        let qkv_in = xs.flatten_to(1)?;
+        let qkv = if let Some(t) = timing.as_deref_mut() {
+            timed_linear(
+                &self.qkv,
+                &qkv_in,
+                &mut t.qkv_s,
+                &mut t.qkv_matmul_s,
+                &mut t.qkv_bias_s,
+            )?
+        } else {
+            self.qkv.forward(&qkv_in)?
+        }
+        .reshape((b, h * w, 3, self.num_heads, c / self.num_heads))?
+        .permute((2, 0, 3, 1, 4))?
+        .reshape((3, b * self.num_heads, h * w, c / self.num_heads))?;
+        if timing.is_some() {
+            sync_for_timing(&qkv)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            if t.qkv_s == 0.0 {
+                t.qkv_s += t0.elapsed().as_secs_f64();
+            }
+        }
         let q = qkv.i(0)?;
         let k = qkv.i(1)?;
         let v = qkv.i(2)?;
+        let t0 = Instant::now();
         let attn = {
             let _enter = self.span_matmul.enter();
             (&q * self.scale)?.matmul(&k.t()?)?
         };
+        if timing.is_some() {
+            sync_for_timing(&attn)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.qk_matmul_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let attn = {
             let _enter = self.span_rel_pos.enter();
             self.add_decomposed_rel_pos(attn, &q, (h, w), (h, w))?
         };
+        if timing.is_some() {
+            sync_for_timing(&attn)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.rel_pos_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let attn = {
             let _enter = self.span_softmax.enter();
             candle_nn::ops::softmax_last_dim(&attn)?
         };
+        if timing.is_some() {
+            sync_for_timing(&attn)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.softmax_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let attn = {
             let _enter = self.span_matmul.enter();
             attn.matmul(&v)?
         };
+        if timing.is_some() {
+            sync_for_timing(&attn)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.av_matmul_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let attn = attn
             .reshape((b, self.num_heads, h, w, c / self.num_heads))?
             .permute((0, 2, 3, 1, 4))?
             .reshape((b, h * w, c))?;
-        self.proj.forward(&attn)?.reshape((b, h, w, c))
+        let out = if let Some(t) = timing.as_deref_mut() {
+            timed_linear(
+                &self.proj,
+                &attn,
+                &mut t.proj_s,
+                &mut t.proj_matmul_s,
+                &mut t.proj_bias_s,
+            )?
+        } else {
+            self.proj.forward(&attn)?
+        }
+        .reshape((b, h, w, c))?;
+        if timing.is_some() {
+            sync_for_timing(&out)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            if t.proj_s == 0.0 {
+                t.proj_s += t0.elapsed().as_secs_f64();
+            }
+            t.total_s += total_start.elapsed().as_secs_f64();
+        }
+        Ok(out)
     }
 }
 
@@ -350,23 +631,116 @@ fn window_unpartition(
 
 impl Module for Block {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_impl(xs, None)
+    }
+}
+
+impl Block {
+    fn forward_with_timing(&self, xs: &Tensor, timing: &mut BlockTiming) -> Result<Tensor> {
+        self.forward_impl(xs, Some(timing))
+    }
+
+    fn forward_impl(&self, xs: &Tensor, mut timing: Option<&mut BlockTiming>) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let total_start = Instant::now();
         let shortcut = xs;
+        let t0 = Instant::now();
         let xs = self.norm1.forward(xs)?;
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.norm1_s += t0.elapsed().as_secs_f64();
+        }
         let hw = (xs.dim(1)?, xs.dim(2)?);
+        let t0 = Instant::now();
         let (xs, pad_hw) = if self.window_size > 0 {
             window_partition(xs, self.window_size)?
         } else {
             (xs, (0, 0))
         };
-        let xs = self.attn.forward(&xs)?;
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.partition_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
+        let xs = if let Some(t) = timing.as_deref_mut() {
+            self.attn.forward_with_timing(&xs, &mut t.attention)?
+        } else {
+            self.attn.forward(&xs)?
+        };
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.attention_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let xs = if self.window_size > 0 {
             window_unpartition(xs, self.window_size, pad_hw, hw)?
         } else {
             xs
         };
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.unpartition_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let xs = (xs + shortcut)?;
-        &xs + xs.apply(&self.norm2)?.apply(&self.mlp)?
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.residual_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
+        let out = if let Some(t) = timing.as_deref_mut() {
+            let norm2_start = Instant::now();
+            let mlp = xs.apply(&self.norm2)?;
+            sync_for_timing(&mlp)?;
+            t.norm2_s += norm2_start.elapsed().as_secs_f64();
+
+            let mlp = timed_linear(
+                &self.mlp.lin1,
+                &mlp,
+                &mut t.mlp_lin1_s,
+                &mut t.mlp_lin1_matmul_s,
+                &mut t.mlp_lin1_bias_s,
+            )?;
+
+            let activation_start = Instant::now();
+            let mlp = mlp.apply(&self.mlp.activation)?;
+            sync_for_timing(&mlp)?;
+            t.mlp_activation_s += activation_start.elapsed().as_secs_f64();
+
+            let mlp = timed_linear(
+                &self.mlp.lin2,
+                &mlp,
+                &mut t.mlp_lin2_s,
+                &mut t.mlp_lin2_matmul_s,
+                &mut t.mlp_lin2_bias_s,
+            )?;
+
+            let residual_start = Instant::now();
+            let out = (&xs + mlp)?;
+            sync_for_timing(&out)?;
+            t.mlp_residual_s += residual_start.elapsed().as_secs_f64();
+            out
+        } else {
+            (&xs + xs.apply(&self.norm2)?.apply(&self.mlp)?)?
+        };
+        if timing.is_some() {
+            sync_for_timing(&out)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.norm2_mlp_s += t0.elapsed().as_secs_f64();
+            t.total_s += total_start.elapsed().as_secs_f64();
+        }
+        Ok(out)
     }
 }
 
@@ -465,25 +839,82 @@ impl ImageEncoderViT {
 
 impl Module for ImageEncoderViT {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_impl(xs, None)
+    }
+}
+
+impl ImageEncoderViT {
+    pub fn forward_with_timing(
+        &self,
+        xs: &Tensor,
+        timing: &mut ImageEncoderViTTiming,
+    ) -> Result<Tensor> {
+        self.forward_impl(xs, Some(timing))
+    }
+
+    fn forward_impl(
+        &self,
+        xs: &Tensor,
+        mut timing: Option<&mut ImageEncoderViTTiming>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let total_start = Instant::now();
+        let t0 = Instant::now();
         let xs = self.patch_embed.forward(xs)?;
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.patch_embed_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
         let mut xs = match &self.pos_embed {
             Some(pos_embed) => xs.broadcast_add(pos_embed)?,
             None => xs,
         };
-        for block in self.blocks.iter() {
-            xs = block.forward(&xs)?
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
         }
-        xs.permute((0, 3, 1, 2))?
+        if let Some(t) = timing.as_deref_mut() {
+            t.pos_embed_s += t0.elapsed().as_secs_f64();
+            t.blocks.resize_with(self.blocks.len(), Default::default);
+        }
+        let t0 = Instant::now();
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            xs = if let Some(t) = timing.as_deref_mut() {
+                block.forward_with_timing(&xs, &mut t.blocks[block_idx])?
+            } else {
+                block.forward(&xs)?
+            }
+        }
+        if timing.is_some() {
+            sync_for_timing(&xs)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.blocks_s += t0.elapsed().as_secs_f64();
+        }
+        let t0 = Instant::now();
+        let out = xs
+            .permute((0, 3, 1, 2))?
             .apply(&self.neck_conv1)?
             .apply(&self.neck_ln1)?
             .apply(&self.neck_conv2)?
-            .apply(&self.neck_ln2)
+            .apply(&self.neck_ln2)?;
+        if timing.is_some() {
+            sync_for_timing(&out)?;
+        }
+        if let Some(t) = timing.as_deref_mut() {
+            t.neck_s += t0.elapsed().as_secs_f64();
+            t.total_s += total_start.elapsed().as_secs_f64();
+        }
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda")]
+    use super::Add3Inplace;
     use super::ImageEncoderViT;
     use candle::{DType, Device, Result, Tensor};
     use candle_nn::{Module, VarBuilder};
@@ -535,5 +966,43 @@ mod tests {
             }
         };
         image_encoder_abs_pos_supports_batched_inputs(&device)
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn add3_inplace_cuda_matches_broadcast_expression() -> Result<()> {
+        let device = match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(err) => {
+                eprintln!("skipping CUDA test: {err}");
+                return Ok(());
+            }
+        };
+        let (b, q_h, q_w, k_h, k_w) = (2, 3, 2, 3, 2);
+        let attn_len = b * q_h * q_w * k_h * k_w;
+        let rel_h_len = b * q_h * q_w * k_h;
+        let rel_w_len = b * q_h * q_w * k_w;
+        let attn_data: Vec<f32> = (0..attn_len).map(|v| v as f32 / 10.0).collect();
+        let rel_h_data: Vec<f32> = (0..rel_h_len).map(|v| v as f32 / 100.0).collect();
+        let rel_w_data: Vec<f32> = (0..rel_w_len).map(|v| -(v as f32) / 200.0).collect();
+
+        let attn = Tensor::from_vec(attn_data, (b, q_h, q_w, k_h, k_w), &device)?;
+        let rel_h = Tensor::from_vec(rel_h_data, (b, q_h, q_w, k_h), &device)?;
+        let rel_w = Tensor::from_vec(rel_w_data, (b, q_h, q_w, k_w), &device)?;
+        let expected = (&attn + rel_h.unsqueeze(4)?.broadcast_add(&rel_w.unsqueeze(3)?)?)?;
+
+        attn.inplace_op3(&rel_h, &rel_w, &Add3Inplace(b, q_h, q_w, k_h, k_w))?;
+        device.synchronize()?;
+
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = attn.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(expected.len(), actual.len());
+        for (idx, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+            assert!(
+                (expected - actual).abs() < 1e-5,
+                "idx {idx}: expected {expected}, got {actual}"
+            );
+        }
+        Ok(())
     }
 }
