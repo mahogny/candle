@@ -125,6 +125,15 @@ pub enum Op {
     },
 
     #[allow(dead_code)]
+    ConvTranspose3D {
+        arg: Tensor,
+        kernel: Tensor,
+        padding: usize,
+        output_padding: usize,
+        stride: usize,
+        dilation: usize,
+    },
+
     ConvTranspose2D {
         arg: Tensor,
         kernel: Tensor,
@@ -146,6 +155,12 @@ pub enum Op {
         stride: (usize, usize),
     },
 
+    MaxPool3D {
+        arg: Tensor,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+    },
+
     UpsampleNearest1D {
         arg: Tensor,
         target_size: usize,
@@ -155,6 +170,14 @@ pub enum Op {
         target_h: usize,
         target_w: usize,
     },
+    UpsampleTrilinear3D {
+        arg: Tensor,
+        target_d: usize,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+    },
+
     UpsampleBilinear2D {
         arg: Tensor,
         target_h: usize,

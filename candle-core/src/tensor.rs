@@ -1407,6 +1407,125 @@ impl Tensor {
         Ok(from_storage(storage, (n, c, h_out, w_out), op, false))
     }
 
+    /// Trilinear interpolation to an explicit output size.
+    ///
+    /// The input must be `(batch, channels, d, h, w)`. Matches
+    /// `torch.nn.functional.interpolate(mode="trilinear", size=...)`.
+    pub fn upsample_trilinear3d(
+        &self,
+        target_d: usize,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+    ) -> Result<Self> {
+        let (n, c, _d, _h, _w) = self.dims5()?;
+        let op = BackpropOp::new1(self, |arg| Op::UpsampleTrilinear3D {
+            arg,
+            target_d,
+            target_h,
+            target_w,
+            align_corners,
+        });
+        let storage = self.storage().upsample_trilinear3d(
+            self.layout(),
+            target_d,
+            target_h,
+            target_w,
+            align_corners,
+            None,
+            None,
+            None,
+        )?;
+        Ok(from_storage(
+            storage,
+            (n, c, target_d, target_h, target_w),
+            op,
+            false,
+        ))
+    }
+
+    /// Trilinear interpolation by scale factors.
+    ///
+    /// Matches `torch.nn.functional.interpolate(mode="trilinear", scale_factor=...)`, which
+    /// derives the source coordinate from the requested factor rather than from the rounded
+    /// output size — the two differ when the size does not divide exactly.
+    pub fn upsample_trilinear3d_with_scale(
+        &self,
+        scale_d: f64,
+        scale_h: f64,
+        scale_w: f64,
+        align_corners: bool,
+    ) -> Result<Self> {
+        let (n, c, d, h, w) = self.dims5()?;
+        let target_d = (d as f64 * scale_d) as usize;
+        let target_h = (h as f64 * scale_h) as usize;
+        let target_w = (w as f64 * scale_w) as usize;
+        let op = BackpropOp::new1(self, |arg| Op::UpsampleTrilinear3D {
+            arg,
+            target_d,
+            target_h,
+            target_w,
+            align_corners,
+        });
+        let storage = self.storage().upsample_trilinear3d(
+            self.layout(),
+            target_d,
+            target_h,
+            target_w,
+            align_corners,
+            Some(scale_d),
+            Some(scale_h),
+            Some(scale_w),
+        )?;
+        Ok(from_storage(
+            storage,
+            (n, c, target_d, target_h, target_w),
+            op,
+            false,
+        ))
+    }
+
+    /// 3D max pooling over the last three dimensions.
+    ///
+    /// The input tensor must have five dimensions, `(batch, channels, d, h, w)`, and the returned
+    /// tensor also has five, `(batch, channels, d', h', w')`. Matches `torch.nn.MaxPool3d`.
+    pub fn max_pool3d<T: crate::ToUsize3>(&self, sz: T) -> Result<Self> {
+        let sz = sz.to_usize3();
+        self.max_pool3d_with_stride(sz, sz)
+    }
+
+    /// Same as `max_pool3d` but with a `stride` that can differ from the kernel size.
+    pub fn max_pool3d_with_stride<T: crate::ToUsize3>(
+        &self,
+        kernel_size: T,
+        stride: T,
+    ) -> Result<Self> {
+        let kernel_size = kernel_size.to_usize3();
+        let stride = stride.to_usize3();
+        let (n, c, d, h, w) = self.dims5()?;
+        if d < kernel_size.0 || h < kernel_size.1 || w < kernel_size.2 {
+            bail!("kernel-size {kernel_size:?} is larger than the input size {d},{h},{w}")
+        }
+        // https://pytorch.org/docs/stable/generated/torch.nn.MaxPool3d.html
+        let d_out = (d - kernel_size.0) / stride.0 + 1;
+        let h_out = (h - kernel_size.1) / stride.1 + 1;
+        let w_out = (w - kernel_size.2) / stride.2 + 1;
+        let op = BackpropOp::new1(self, |arg| Op::MaxPool3D {
+            arg,
+            kernel_size,
+            stride,
+        });
+        let storage = self
+            .storage()
+            .max_pool3d(self.layout(), kernel_size, stride)?;
+        Ok(from_storage(
+            storage,
+            (n, c, d_out, h_out, w_out),
+            op,
+            false,
+        ))
+    }
+
     /// Computes the dot product of two 1D tensors.
     ///
     /// - If inputs are 1D vectors (`[n]`), returns their scalar dot product.

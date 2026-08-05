@@ -125,6 +125,16 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn conv_transpose3d(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn conv_transpose2d(
         &self,
         _l: &Layout,
@@ -213,11 +223,35 @@ impl crate::backend::BackendStorage for MetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    fn max_pool3d(
+        &self,
+        _: &Layout,
+        _: (usize, usize, usize),
+        _: (usize, usize, usize),
+    ) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     fn upsample_nearest1d(&self, _: &Layout, _: usize) -> Result<Self> {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
     fn upsample_nearest2d(&self, _: &Layout, _: usize, _: usize) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsample_trilinear3d(
+        &self,
+        _: &Layout,
+        _target_d: usize,
+        _target_h: usize,
+        _target_w: usize,
+        _align_corners: bool,
+        _scale_d: Option<f64>,
+        _scale_h: Option<f64>,
+        _scale_w: Option<f64>,
+    ) -> Result<Self> {
         Err(Error::NotCompiledWithMetalSupport)
     }
 

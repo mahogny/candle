@@ -115,3 +115,100 @@ test_device!(
     upsample_nearest2d_gpu,
     upsample_nearest2d_metal
 );
+
+/// Reference values from PyTorch:
+/// ```python
+/// x = (torch.arange(1*2*4*6*6, dtype=torch.float32).reshape(1,2,4,6,6) % 37) - 18
+/// torch.nn.functional.max_pool3d(x, kernel_size=k, stride=s)
+/// ```
+fn max_pool3d_input(dev: &Device) -> Result<Tensor> {
+    let data: Vec<f32> = (0..(1 * 2 * 4 * 6 * 6))
+        .map(|i| (i % 37) as f32 - 18.0)
+        .collect();
+    Tensor::from_vec(data, (1, 2, 4, 6, 6), dev)
+}
+
+fn max_pool3d(dev: &Device) -> Result<()> {
+    let t = max_pool3d_input(dev)?;
+
+    let pooled = t.max_pool3d((2, 2, 2))?;
+    assert_eq!(pooled.dims(), &[1, 2, 2, 3, 3]);
+    let flat = pooled.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(
+        &flat[..9],
+        &[18., -9., -7., 1., 3., 5., 13., 15., 17.]
+    );
+    assert_eq!(flat.iter().sum::<f32>(), 277.);
+
+    let pooled = t.max_pool3d((2, 3, 3))?;
+    assert_eq!(pooled.dims(), &[1, 2, 2, 2, 2]);
+    let flat = pooled.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(&flat[..4], &[18., -1., 14., 17.]);
+    assert_eq!(flat.iter().sum::<f32>(), 203.);
+
+    // Overlapping windows: kernel larger than stride.
+    let pooled = t.max_pool3d_with_stride((3, 3, 3), (1, 1, 1))?;
+    assert_eq!(pooled.dims(), &[1, 2, 2, 4, 4]);
+    let flat = pooled.flatten_all()?.to_vec1::<f32>()?;
+    assert_eq!(&flat[..8], &[18., 18., -2., -1., 2., 3., 4., 5.]);
+    assert_eq!(flat.iter().sum::<f32>(), 584.);
+
+    Ok(())
+}
+
+test_device!(max_pool3d, max_pool3d_cpu, max_pool3d_gpu, max_pool3d_metal);
+
+/// Reference values from PyTorch:
+/// ```python
+/// x = (torch.arange(1*2*3*4*5, dtype=torch.float32).reshape(1,2,3,4,5) % 23) - 11
+/// torch.nn.functional.interpolate(x, scale_factor=2, mode="trilinear", align_corners=False)
+/// ```
+fn upsample_trilinear3d(dev: &Device) -> Result<()> {
+    let data: Vec<f32> = (0..(1 * 2 * 3 * 4 * 5))
+        .map(|i| (i % 23) as f32 - 11.0)
+        .collect();
+    let t = Tensor::from_vec(data, (1, 2, 3, 4, 5), dev)?;
+
+    // ClearMap's vessel-filling network uses exactly this: scale 2, align_corners=false.
+    let up = t.upsample_trilinear3d_with_scale(2.0, 2.0, 2.0, false)?;
+    assert_eq!(up.dims(), &[1, 2, 6, 8, 10]);
+    let flat = up.flatten_all()?.to_vec1::<f32>()?;
+    let expected = [
+        -11.0f32, -10.75, -10.25, -9.75, -9.25, -8.75, -8.25, -7.75,
+    ];
+    for (got, want) in flat.iter().zip(expected.iter()) {
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+    assert!((flat.iter().sum::<f32>() - (-360.0)).abs() < 1e-2);
+
+    let up = t.upsample_trilinear3d_with_scale(2.0, 2.0, 2.0, true)?;
+    let flat = up.flatten_all()?.to_vec1::<f32>()?;
+    let expected = [
+        -11.0f32, -10.555556, -10.111112, -9.666667, -9.222222, -8.777778, -8.333333, -7.888889,
+    ];
+    for (got, want) in flat.iter().zip(expected.iter()) {
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+    assert!((flat.iter().sum::<f32>() - (-395.047668)).abs() < 1e-2);
+
+    // Explicit size, not an integer multiple.
+    let up = t.upsample_trilinear3d(5, 7, 9, false)?;
+    assert_eq!(up.dims(), &[1, 2, 5, 7, 9]);
+    let flat = up.flatten_all()?.to_vec1::<f32>()?;
+    let expected = [
+        -11.0f32, -10.666667, -10.111111, -9.555555, -9.0, -8.444445, -7.888889, -7.333333,
+    ];
+    for (got, want) in flat.iter().zip(expected.iter()) {
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+    assert!((flat.iter().sum::<f32>() - (-239.042877)).abs() < 1e-2);
+
+    Ok(())
+}
+
+test_device!(
+    upsample_trilinear3d,
+    upsample_trilinear3d_cpu,
+    upsample_trilinear3d_gpu,
+    upsample_trilinear3d_metal
+);

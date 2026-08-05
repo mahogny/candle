@@ -1331,3 +1331,64 @@ test_device!(
     conv2d_noncontiguous_input_gpu,
     conv2d_noncontiguous_input_metal
 );
+
+/// Reference values from PyTorch:
+/// ```python
+/// x = ((torch.arange(n, dtype=torch.float32) % 17) - 8).reshape(shape)
+/// w = ((torch.arange(kn, dtype=torch.float32) % 11) - 5).reshape(c_in, c_out, k, k, k) / 7.0
+/// torch.nn.functional.conv_transpose3d(x, w, stride=..., padding=..., dilation=...)
+/// ```
+fn conv_transpose3d(dev: &Device) -> Result<()> {
+    let build = |shape: (usize, usize, usize, usize, usize),
+                 c_in: usize,
+                 c_out: usize,
+                 k: usize|
+     -> Result<(Tensor, Tensor)> {
+        let n = shape.0 * shape.1 * shape.2 * shape.3 * shape.4;
+        let x: Vec<f32> = (0..n).map(|i| (i % 17) as f32 - 8.0).collect();
+        let x = Tensor::from_vec(x, shape, dev)?;
+        let kn = c_in * c_out * k * k * k;
+        let w: Vec<f32> = (0..kn).map(|i| ((i % 11) as f32 - 5.0) / 7.0).collect();
+        let w = Tensor::from_vec(w, (c_in, c_out, k, k, k), dev)?;
+        Ok((x, w))
+    };
+
+    // stride 1, no padding
+    let (x, w) = build((1, 2, 3, 4, 5), 2, 3, 3)?;
+    let y = x.conv_transpose3d(&w, 0, 0, 1, 1)?;
+    assert_eq!(y.dims(), &[1, 3, 5, 6, 7]);
+    let flat = y.flatten_all()?.to_vec1::<f32>()?;
+    for (got, want) in flat.iter().zip([5.571429f32, 9.285715, 11.428571, 9.714286].iter()) {
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+    assert!((flat.iter().sum::<f32>() - 80.000031).abs() < 1e-2);
+
+    // ClearMap's vessel-filling conv3: kernel 7, stride 2, padding 3.
+    let (x, w) = build((1, 3, 4, 5, 6), 3, 2, 7)?;
+    let y = x.conv_transpose3d(&w, 3, 0, 2, 1)?;
+    assert_eq!(y.dims(), &[1, 2, 7, 9, 11]);
+    let flat = y.flatten_all()?.to_vec1::<f32>()?;
+    for (got, want) in flat
+        .iter()
+        .zip([-4.571428f32, 18.857143, 0.0, 17.428568, -7.142858, 6.857142].iter())
+    {
+        assert!((got - want).abs() < 1e-4, "got {got} want {want}");
+    }
+    assert!((flat.iter().sum::<f32>() - (-12.000313)).abs() < 1e-2);
+
+    // dilation > 1, batch > 1
+    let (x, w) = build((2, 2, 3, 3, 4), 2, 2, 3)?;
+    let y = x.conv_transpose3d(&w, 1, 0, 2, 2)?;
+    assert_eq!(y.dims(), &[2, 2, 7, 7, 9]);
+    let flat = y.flatten_all()?.to_vec1::<f32>()?;
+    assert!((flat.iter().sum::<f32>() - 34.142868).abs() < 1e-2);
+
+    Ok(())
+}
+
+test_device!(
+    conv_transpose3d,
+    conv_transpose3d_cpu,
+    conv_transpose3d_gpu,
+    conv_transpose3d_metal
+);

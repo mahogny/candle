@@ -401,6 +401,61 @@ impl Map1 for MaxPool2D {
     }
 }
 
+struct MaxPool3D((usize, usize, usize), (usize, usize, usize));
+
+impl Map1 for MaxPool3D {
+    fn f<T: WithDType>(&self, src: &[T], layout: &Layout) -> Result<Vec<T>> {
+        // https://pytorch.org/docs/stable/generated/torch.nn.MaxPool3d.html
+        let (k_d, k_h, k_w) = self.0;
+        let (s_d, s_h, s_w) = self.1;
+        let (b_sz, c, d, h, w) = layout.shape().dims5()?;
+        let stride = layout.stride();
+        let (stride_d, stride_h, stride_w) = (stride[2], stride[3], stride[4]);
+        let d_out = (d - k_d) / s_d + 1;
+        let h_out = (h - k_h) / s_h + 1;
+        let w_out = (w - k_w) / s_w + 1;
+        let src_index = layout.start_offset();
+        let mut dst = vec![T::zero(); b_sz * c * d_out * h_out * w_out];
+        for b_idx in 0..b_sz {
+            let dst = &mut dst[b_idx * c * d_out * h_out * w_out..];
+            let src_index = src_index + b_idx * stride[0];
+            for c_idx in 0..c {
+                let dst = &mut dst[c_idx * d_out * h_out * w_out..];
+                let src_index = src_index + c_idx * stride[1];
+                for d_idx in 0..d_out {
+                    for h_idx in 0..h_out {
+                        for w_idx in 0..w_out {
+                            let mut largest = src[src_index
+                                + s_d * d_idx * stride_d
+                                + s_h * h_idx * stride_h
+                                + s_w * w_idx * stride_w];
+                            for l in 0..k_d {
+                                for m in 0..k_h {
+                                    for n in 0..k_w {
+                                        let l = s_d * d_idx + l;
+                                        let m = s_h * h_idx + m;
+                                        let n = s_w * w_idx + n;
+                                        let value =
+                                            src[src_index
+                                                + l * stride_d
+                                                + m * stride_h
+                                                + n * stride_w];
+                                        if largest < value {
+                                            largest = value
+                                        }
+                                    }
+                                }
+                            }
+                            dst[(d_idx * h_out + h_idx) * w_out + w_idx] = largest;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(dst)
+    }
+}
+
 struct UpsampleNearest1D(usize);
 
 impl Map1 for UpsampleNearest1D {
@@ -460,6 +515,99 @@ impl Map1 for UpsampleNearest2D {
                     for (w_idx, src_w_idx) in src_w_idxs.iter().enumerate() {
                         let src_index = src_index + src_h_idx * stride_h + src_w_idx * stride_w;
                         dst[h_idx * dst_w + w_idx] = src[src_index]
+                    }
+                }
+            }
+        }
+        Ok(dst)
+    }
+}
+
+struct UpsampleTrilinear3D {
+    target_d: usize,
+    target_h: usize,
+    target_w: usize,
+    align_corners: bool,
+    scale_d_factor: Option<f64>,
+    scale_h_factor: Option<f64>,
+    scale_w_factor: Option<f64>,
+}
+
+impl UpsampleTrilinear3D {
+    /// PyTorch's `area_pixel_compute_scale` followed by `area_pixel_compute_source_index`,
+    /// returning the (low, high, weight) triple for each output position on one axis.
+    fn axis_indices(
+        &self,
+        size_in: usize,
+        size_out: usize,
+        scale_factor: Option<f64>,
+    ) -> Vec<(usize, usize, f64)> {
+        let scale = if self.align_corners {
+            if size_out > 1 {
+                (size_in - 1) as f64 / (size_out - 1) as f64
+            } else {
+                0.0
+            }
+        } else if let Some(scale_factor) = scale_factor {
+            1.0 / scale_factor
+        } else {
+            size_in as f64 / size_out as f64
+        };
+        (0..size_out)
+            .map(|out_idx| {
+                let src = if self.align_corners {
+                    scale * out_idx as f64
+                } else {
+                    scale * (out_idx as f64 + 0.5) - 0.5
+                };
+                let src = src.max(0.0);
+                let low = src.floor() as usize;
+                let high = (low + 1).min(size_in - 1);
+                let weight = (src - low as f64).clamp(0.0, 1.0);
+                (low, high, weight)
+            })
+            .collect()
+    }
+}
+
+impl Map1 for UpsampleTrilinear3D {
+    fn f<T: WithDType>(&self, src: &[T], layout: &Layout) -> Result<Vec<T>> {
+        let (batch, channels, depth_in, height_in, width_in) = layout.shape().dims5()?;
+        let (depth_out, height_out, width_out) = (self.target_d, self.target_h, self.target_w);
+
+        if depth_in == depth_out && height_in == height_out && width_in == width_out {
+            return Ok(src.to_vec());
+        }
+
+        let stride = layout.stride();
+        let src_offset = layout.start_offset();
+        let (stride_d, stride_h, stride_w) = (stride[2], stride[3], stride[4]);
+
+        let d_indices = self.axis_indices(depth_in, depth_out, self.scale_d_factor);
+        let h_indices = self.axis_indices(height_in, height_out, self.scale_h_factor);
+        let w_indices = self.axis_indices(width_in, width_out, self.scale_w_factor);
+
+        let mut dst = vec![T::zero(); batch * channels * depth_out * height_out * width_out];
+        let mut dst_idx = 0;
+        for b_idx in 0..batch {
+            for c_idx in 0..channels {
+                let base = src_offset + b_idx * stride[0] + c_idx * stride[1];
+                for &(d0, d1, wd) in d_indices.iter() {
+                    for &(h0, h1, wh) in h_indices.iter() {
+                        for &(w0, w1, ww) in w_indices.iter() {
+                            let at = |d: usize, h: usize, w: usize| {
+                                src[base + d * stride_d + h * stride_h + w * stride_w]
+                                    .to_f64()
+                            };
+                            let c00 = at(d0, h0, w0) * (1.0 - ww) + at(d0, h0, w1) * ww;
+                            let c01 = at(d0, h1, w0) * (1.0 - ww) + at(d0, h1, w1) * ww;
+                            let c10 = at(d1, h0, w0) * (1.0 - ww) + at(d1, h0, w1) * ww;
+                            let c11 = at(d1, h1, w0) * (1.0 - ww) + at(d1, h1, w1) * ww;
+                            let c0 = c00 * (1.0 - wh) + c01 * wh;
+                            let c1 = c10 * (1.0 - wh) + c11 * wh;
+                            dst[dst_idx] = T::from_f64(c0 * (1.0 - wd) + c1 * wd);
+                            dst_idx += 1;
+                        }
                     }
                 }
             }
@@ -1235,6 +1383,91 @@ impl Map2 for ConvTranspose1D<'_> {
                     }
                 }
             })
+        }
+        Ok(dst)
+    }
+}
+
+struct ConvTranspose3D<'a>(&'a crate::conv::ParamsConvTranspose3D);
+
+impl Map2 for ConvTranspose3D<'_> {
+    const OP: &'static str = "conv_transpose3d";
+    fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+        let p = self.0;
+        let inp = &inp[inp_l.start_offset()..];
+        let (inp_s0, inp_s1, inp_s2, inp_s3, inp_s4) = crate::shape::dims5(inp_l.stride())?;
+        let k = &k[k_l.start_offset()..];
+        let (k_s0, k_s1, k_s2, k_s3, k_s4) = crate::shape::dims5(k_l.stride())?;
+        let (out_d, out_h, out_w) = (p.out_d(), p.out_h(), p.out_w());
+
+        // Output shape: [b_size, c_out, out_d, out_h, out_w].
+        let mut dst = vec![T::zero(); p.b_size * p.c_out * out_d * out_h * out_w];
+        let dst_s0 = p.c_out * out_d * out_h * out_w;
+        let dst_s1 = out_d * out_h * out_w;
+        let dst_s2 = out_h * out_w;
+        let dst_s3 = out_w;
+
+        // Scatter each input voxel into the output positions its kernel reaches.
+        for b_idx in 0..p.b_size {
+            for inp_z in 0..p.i_d {
+                for inp_y in 0..p.i_h {
+                    for inp_x in 0..p.i_w {
+                        for k_z in 0..p.k_d {
+                            let out_z = inp_z * p.stride + k_z * p.dilation;
+                            if out_z < p.padding {
+                                continue;
+                            }
+                            let out_z = out_z - p.padding;
+                            if out_z >= out_d {
+                                continue;
+                            }
+                            for k_y in 0..p.k_h {
+                                let out_y = inp_y * p.stride + k_y * p.dilation;
+                                if out_y < p.padding {
+                                    continue;
+                                }
+                                let out_y = out_y - p.padding;
+                                if out_y >= out_h {
+                                    continue;
+                                }
+                                for k_x in 0..p.k_w {
+                                    let out_x = inp_x * p.stride + k_x * p.dilation;
+                                    if out_x < p.padding {
+                                        continue;
+                                    }
+                                    let out_x = out_x - p.padding;
+                                    if out_x >= out_w {
+                                        continue;
+                                    }
+                                    for c_in_idx in 0..p.c_in {
+                                        let inp_value = inp[b_idx * inp_s0
+                                            + c_in_idx * inp_s1
+                                            + inp_z * inp_s2
+                                            + inp_y * inp_s3
+                                            + inp_x * inp_s4];
+                                        if inp_value.is_zero() {
+                                            continue;
+                                        }
+                                        for dst_c_idx in 0..p.c_out {
+                                            let k_value = k[c_in_idx * k_s0
+                                                + dst_c_idx * k_s1
+                                                + k_z * k_s2
+                                                + k_y * k_s3
+                                                + k_x * k_s4];
+                                            let dst_idx = b_idx * dst_s0
+                                                + dst_c_idx * dst_s1
+                                                + out_z * dst_s2
+                                                + out_y * dst_s3
+                                                + out_x;
+                                            dst[dst_idx] += inp_value * k_value;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(dst)
     }
@@ -2365,12 +2598,45 @@ impl BackendStorage for CpuStorage {
         MaxPool2D(kernel_size, stride).map(self, layout)
     }
 
+    fn max_pool3d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+    ) -> Result<Self> {
+        MaxPool3D(kernel_size, stride).map(self, layout)
+    }
+
     fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
         UpsampleNearest1D(sz).map(self, layout)
     }
 
     fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
         UpsampleNearest2D(h, w).map(self, layout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsample_trilinear3d(
+        &self,
+        layout: &Layout,
+        target_d: usize,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+        scale_d: Option<f64>,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        UpsampleTrilinear3D {
+            target_d,
+            target_h,
+            target_w,
+            align_corners,
+            scale_d_factor: scale_d,
+            scale_h_factor: scale_h,
+            scale_w_factor: scale_w,
+        }
+        .map(self, layout)
     }
 
     fn upsample_bilinear2d(
@@ -2871,6 +3137,16 @@ impl BackendStorage for CpuStorage {
         params: &crate::conv::ParamsConv3D,
     ) -> Result<Self> {
         Conv3D(params).map(self, l, kernel, kernel_l)
+    }
+
+    fn conv_transpose3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        ConvTranspose3D(params).map(self, l, kernel, kernel_l)
     }
 
     fn conv_transpose2d(

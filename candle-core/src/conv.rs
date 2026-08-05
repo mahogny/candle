@@ -172,6 +172,50 @@ impl ParamsConvTranspose2D {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamsConvTranspose3D {
+    pub(crate) b_size: usize,
+    pub(crate) i_d: usize,
+    pub(crate) i_h: usize,
+    pub(crate) i_w: usize,
+    pub(crate) k_d: usize,
+    pub(crate) k_h: usize,
+    pub(crate) k_w: usize,
+    pub(crate) c_out: usize,
+    pub(crate) c_in: usize,
+    pub(crate) padding: usize,
+    pub(crate) output_padding: usize,
+    pub(crate) stride: usize,
+    pub(crate) dilation: usize,
+}
+
+impl ParamsConvTranspose3D {
+    pub(crate) fn out_d(&self) -> usize {
+        (self.i_d - 1) * self.stride + self.dilation * (self.k_d - 1) + self.output_padding + 1
+            - 2 * self.padding
+    }
+
+    pub(crate) fn out_h(&self) -> usize {
+        (self.i_h - 1) * self.stride + self.dilation * (self.k_h - 1) + self.output_padding + 1
+            - 2 * self.padding
+    }
+
+    pub(crate) fn out_w(&self) -> usize {
+        (self.i_w - 1) * self.stride + self.dilation * (self.k_w - 1) + self.output_padding + 1
+            - 2 * self.padding
+    }
+
+    pub(crate) fn out_dims(&self) -> Vec<usize> {
+        vec![
+            self.b_size,
+            self.c_out,
+            self.out_d(),
+            self.out_h(),
+            self.out_w(),
+        ]
+    }
+}
+
 impl Tensor {
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
         let storage =
@@ -503,6 +547,57 @@ impl Tensor {
             &params,
         )?;
         let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose2D {
+            arg,
+            kernel,
+            padding: params.padding,
+            output_padding: params.output_padding,
+            stride: params.stride,
+            dilation: params.dilation,
+        });
+        let out_dims = params.out_dims();
+        Ok(crate::tensor::from_storage(storage, out_dims, op, false))
+    }
+
+    /// Applies a 3D transposed convolution over the input tensor.
+    ///
+    /// The input has dimensions `(b_size, c_in, i_d, i_h, i_w)` and the kernel
+    /// `(c_in, c_out, k_d, k_h, k_w)` — note the channel order is the transpose of `conv3d`,
+    /// matching `torch.nn.ConvTranspose3d`.
+    pub fn conv_transpose3d(
+        &self,
+        kernel: &Self,
+        padding: usize,
+        output_padding: usize,
+        stride: usize,
+        dilation: usize,
+    ) -> Result<Self> {
+        let (b_size, c_in, i_d, i_h, i_w) = self.dims5()?;
+        let (c_in_k, c_out, k_d, k_h, k_w) = kernel.dims5()?;
+        if c_in != c_in_k {
+            crate::bail!("in_channel mismatch between input ({c_in}) and kernel ({c_in_k})")
+        }
+        let params = ParamsConvTranspose3D {
+            b_size,
+            i_d,
+            i_h,
+            i_w,
+            k_d,
+            k_h,
+            k_w,
+            c_out,
+            c_in,
+            padding,
+            output_padding,
+            stride,
+            dilation,
+        };
+        let storage = self.storage().conv_transpose3d(
+            self.layout(),
+            &kernel.storage(),
+            kernel.layout(),
+            &params,
+        )?;
+        let op = BackpropOp::new2(self, kernel, |arg, kernel| Op::ConvTranspose3D {
             arg,
             kernel,
             padding: params.padding,
