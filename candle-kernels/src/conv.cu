@@ -407,6 +407,81 @@ __device__ void conv_transpose1d(
   dst[dst_i] = static_cast<T>(d);
 }
 
+// Naive implementation of conv_transpose3d.
+template <typename T, typename A>
+__device__ void conv_transpose3d(
+    const size_t src_numel,
+    const size_t d_out,
+    const size_t h_out,
+    const size_t w_out,
+    const size_t stride,
+    const size_t padding,
+    const size_t out_padding,
+    const size_t dilation,
+    const size_t *info,
+    const T *src,
+    const T *kernel,
+    T *dst
+) {
+  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  // k: (c_in, c_out, d_k, h_k, w_k)
+  const size_t *src_dims = info;
+  const size_t *src_s = info + 5;
+  const size_t *k_dims = info + 10;
+  const size_t *k_s = info + 15;
+  const size_t d_k = k_dims[2];
+  const size_t h_k = k_dims[3];
+  const size_t w_k = k_dims[4];
+  const size_t c_out = k_dims[1];
+  const size_t c_in = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+  if (dst_i >= src_dims[0] * c_out * d_out * h_out * w_out) {
+    return;
+  }
+
+  const size_t out_x = dst_i % w_out;
+  const size_t out_y = (dst_i / w_out) % h_out;
+  const size_t out_z = (dst_i / (w_out * h_out)) % d_out;
+  const size_t dst_c_idx = (dst_i / (w_out * h_out * d_out)) % c_out;
+  const size_t b_idx = dst_i / (w_out * h_out * d_out * c_out);
+
+  const size_t src_idx0 = b_idx * src_s[0];
+  A d = 0;
+  for (int k_z = 0; k_z < (int)d_k; ++k_z) {
+    int inp_z_stride = (int)(out_z + padding) - k_z * dilation;
+    if (inp_z_stride < 0 || inp_z_stride % stride) {
+      continue;
+    }
+    int inp_z = inp_z_stride / stride;
+    if (inp_z >= d_in) continue;
+    for (int k_y = 0; k_y < (int)h_k; ++k_y) {
+      int inp_y_stride = (int)(out_y + padding) - k_y * dilation;
+      if (inp_y_stride < 0 || inp_y_stride % stride) {
+        continue;
+      }
+      int inp_y = inp_y_stride / stride;
+      if (inp_y >= h_in) continue;
+      for (int k_x = 0; k_x < (int)w_k; ++k_x) {
+        int inp_x_stride = (int)(out_x + padding) - k_x * dilation;
+        if (inp_x_stride < 0 || inp_x_stride % stride) {
+          continue;
+        }
+        int inp_x = inp_x_stride / stride;
+        if (inp_x >= w_in) continue;
+        for (size_t src_c_idx = 0; src_c_idx < c_in; ++src_c_idx) {
+          const size_t src_idx = src_idx0 + src_c_idx * src_s[1] + inp_z * src_s[2] + inp_y * src_s[3] + inp_x * src_s[4];
+          const size_t k_idx = src_c_idx * k_s[0] + dst_c_idx * k_s[1] + k_z * k_s[2] + k_y * k_s[3] + k_x * k_s[4];
+          d += static_cast<A>(src[src_idx]) * static_cast<A>(kernel[k_idx]);
+        }
+      }
+    }
+  }
+  dst[dst_i] = static_cast<T>(d);
+}
+
 // Naive implementation of conv_transpose2d.
 template <typename T, typename A>
 __device__ void conv_transpose2d(
@@ -584,6 +659,74 @@ __device__ void max_pool2d(
 }
 
 template <typename T>
+__device__ void max_pool3d(
+    const size_t src_numel,
+    const size_t d_k,
+    const size_t h_k,
+    const size_t w_k,
+    const size_t d_stride,
+    const size_t h_stride,
+    const size_t w_stride,
+    const size_t *info,
+    const T *src,
+    T *dst
+) {
+  const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+  // src: (b_size, c_in, d_in, h_in, w_in)
+  const size_t *src_dims = info;
+  const size_t *src_s = info + 5;
+
+  const size_t c = src_dims[1];
+  const size_t d_in = src_dims[2];
+  const size_t h_in = src_dims[3];
+  const size_t w_in = src_dims[4];
+
+  const size_t d_out = (d_in - d_k) / d_stride + 1;
+  const size_t h_out = (h_in - h_k) / h_stride + 1;
+  const size_t w_out = (w_in - w_k) / w_stride + 1;
+  if (dst_i >= src_dims[0] * c * d_out * h_out * w_out) {
+    return;
+  }
+
+  const size_t dst_w = dst_i % w_out;
+  const size_t dst_h = (dst_i / w_out) % h_out;
+  const size_t dst_d = (dst_i / (w_out * h_out)) % d_out;
+  const size_t c_idx = (dst_i / (w_out * h_out * d_out)) % c;
+  const size_t b_idx = dst_i / (w_out * h_out * d_out * c);
+
+  const size_t src_idx0 = b_idx * src_s[0] + c_idx * src_s[1];
+  T d = 0;
+  bool set = false;
+  for (size_t d_offset = 0; d_offset < d_k; ++d_offset) {
+    size_t src_d = d_stride * dst_d + d_offset;
+    if (src_d >= d_in) {
+      continue;
+    }
+    for (size_t h_offset = 0; h_offset < h_k; ++h_offset) {
+      size_t src_h = h_stride * dst_h + h_offset;
+      if (src_h >= h_in) {
+        continue;
+      }
+      for (size_t w_offset = 0; w_offset < w_k; ++w_offset) {
+        size_t src_w = w_stride * dst_w + w_offset;
+        if (src_w >= w_in) {
+          continue;
+        }
+        const size_t src_idx = src_idx0 + src_d * src_s[2] + src_h * src_s[3] + src_w * src_s[4];
+        if (set) {
+          d = maxg(d, src[src_idx]);
+        }
+        else {
+          d = src[src_idx];
+          set = true;
+        }
+      }
+    }
+  }
+  dst[dst_i] = d;
+}
+
+template <typename T>
 __device__ void upsample_nearest2d(
     const size_t w_out,
     const size_t h_out,
@@ -623,6 +766,104 @@ __device__ void upsample_nearest2d(
 
   const size_t src_i = b_idx * src_s[0] + c_idx * src_s[1] + src_w * src_s[2] + src_h * src_s[3];
   dst[dst_i] = src[src_i];
+}
+
+template <typename scalar_t>
+__device__ void upsample_trilinear3d(
+    const size_t d_out,
+    const size_t h_out,
+    const size_t w_out,
+    const bool align_corners,
+    const bool has_scale_d,
+    const double scale_d_factor,
+    const bool has_scale_h,
+    const double scale_h_factor,
+    const bool has_scale_w,
+    const double scale_w_factor,
+    const size_t *info,
+    const scalar_t *src,
+    scalar_t *dst
+) {
+    const size_t dst_i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // src: (b_size, c_in, d_in, h_in, w_in)
+    const size_t *src_dims = info;
+    const size_t *src_s = info + 5;
+
+    const size_t c = src_dims[1];
+    const size_t d_in = src_dims[2];
+    const size_t h_in = src_dims[3];
+    const size_t w_in = src_dims[4];
+
+    if (dst_i >= src_dims[0] * c * d_out * h_out * w_out) {
+        return;
+    }
+
+    const size_t dst_w = dst_i % w_out;
+    const size_t dst_h = (dst_i / w_out) % h_out;
+    const size_t dst_d = (dst_i / (w_out * h_out)) % d_out;
+    const size_t c_idx = (dst_i / (w_out * h_out * d_out)) % c;
+    const size_t b_idx = dst_i / (w_out * h_out * d_out * c);
+
+    // PyTorch's area_pixel_compute_scale.
+    double d_scale, h_scale, w_scale;
+    if (align_corners) {
+        d_scale = (d_out > 1) ? static_cast<double>(d_in - 1) / (d_out - 1) : 0.0;
+        h_scale = (h_out > 1) ? static_cast<double>(h_in - 1) / (h_out - 1) : 0.0;
+        w_scale = (w_out > 1) ? static_cast<double>(w_in - 1) / (w_out - 1) : 0.0;
+    } else {
+        d_scale = has_scale_d ? (1.0 / scale_d_factor) : (static_cast<double>(d_in) / d_out);
+        h_scale = has_scale_h ? (1.0 / scale_h_factor) : (static_cast<double>(h_in) / h_out);
+        w_scale = has_scale_w ? (1.0 / scale_w_factor) : (static_cast<double>(w_in) / w_out);
+    }
+
+    double src_d_fp, src_h_fp, src_w_fp;
+    if (align_corners) {
+        src_d_fp = d_scale * dst_d;
+        src_h_fp = h_scale * dst_h;
+        src_w_fp = w_scale * dst_w;
+    } else {
+        src_d_fp = d_scale * (dst_d + 0.5) - 0.5;
+        src_h_fp = h_scale * (dst_h + 0.5) - 0.5;
+        src_w_fp = w_scale * (dst_w + 0.5) - 0.5;
+    }
+
+    src_d_fp = fmax(0.0, src_d_fp);
+    src_h_fp = fmax(0.0, src_h_fp);
+    src_w_fp = fmax(0.0, src_w_fp);
+
+    size_t d0 = static_cast<size_t>(floor(src_d_fp));
+    size_t h0 = static_cast<size_t>(floor(src_h_fp));
+    size_t w0 = static_cast<size_t>(floor(src_w_fp));
+    size_t d1 = min(d0 + 1, d_in - 1);
+    size_t h1 = min(h0 + 1, h_in - 1);
+    size_t w1 = min(w0 + 1, w_in - 1);
+
+    double wd = fmin(fmax(src_d_fp - d0, 0.0), 1.0);
+    double wh = fmin(fmax(src_h_fp - h0, 0.0), 1.0);
+    double ww = fmin(fmax(src_w_fp - w0, 0.0), 1.0);
+
+    const size_t base = b_idx * src_s[0] + c_idx * src_s[1];
+    const size_t sd = src_s[2], sh = src_s[3], sw = src_s[4];
+
+    const double v000 = static_cast<double>(src[base + d0 * sd + h0 * sh + w0 * sw]);
+    const double v001 = static_cast<double>(src[base + d0 * sd + h0 * sh + w1 * sw]);
+    const double v010 = static_cast<double>(src[base + d0 * sd + h1 * sh + w0 * sw]);
+    const double v011 = static_cast<double>(src[base + d0 * sd + h1 * sh + w1 * sw]);
+    const double v100 = static_cast<double>(src[base + d1 * sd + h0 * sh + w0 * sw]);
+    const double v101 = static_cast<double>(src[base + d1 * sd + h0 * sh + w1 * sw]);
+    const double v110 = static_cast<double>(src[base + d1 * sd + h1 * sh + w0 * sw]);
+    const double v111 = static_cast<double>(src[base + d1 * sd + h1 * sh + w1 * sw]);
+
+    const double c00 = v000 * (1.0 - ww) + v001 * ww;
+    const double c01 = v010 * (1.0 - ww) + v011 * ww;
+    const double c10 = v100 * (1.0 - ww) + v101 * ww;
+    const double c11 = v110 * (1.0 - ww) + v111 * ww;
+
+    const double c0 = c00 * (1.0 - wh) + c01 * wh;
+    const double c1 = c10 * (1.0 - wh) + c11 * wh;
+
+    dst[dst_i] = static_cast<scalar_t>(c0 * (1.0 - wd) + c1 * wd);
 }
 
 template <typename scalar_t>
@@ -856,6 +1097,24 @@ extern "C" __global__ void FN_NAME(  \
   conv_transpose2d<TYPENAME, TYPEACC>(src_numel, w_out, h_out, stride, padding, out_padding, dilation, info, src, kernel, dst); \
 } \
 
+#define CONVT3D_OP(TYPENAME, TYPEACC, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t src_numel, \
+    const size_t d_out, \
+    const size_t h_out, \
+    const size_t w_out, \
+    const size_t stride, \
+    const size_t padding, \
+    const size_t out_padding, \
+    const size_t dilation, \
+    const size_t *info, \
+    const TYPENAME *src, \
+    const TYPENAME *kernel, \
+    TYPENAME *dst \
+) {  \
+  conv_transpose3d<TYPENAME, TYPEACC>(src_numel, d_out, h_out, w_out, stride, padding, out_padding, dilation, info, src, kernel, dst); \
+} \
+
 #define AVG_POOL2D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t src_numel, \
@@ -884,6 +1143,22 @@ extern "C" __global__ void FN_NAME(  \
   max_pool2d<TYPENAME>(src_numel, w_k, h_k, w_stride, h_stride, info, src, dst); \
 } \
 
+#define MAX_POOL3D_OP(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t src_numel, \
+    const size_t d_k, \
+    const size_t h_k, \
+    const size_t w_k, \
+    const size_t d_stride, \
+    const size_t h_stride, \
+    const size_t w_stride, \
+    const size_t *info, \
+    const TYPENAME *src, \
+    TYPENAME *dst \
+) {  \
+  max_pool3d<TYPENAME>(src_numel, d_k, h_k, w_k, d_stride, h_stride, w_stride, info, src, dst); \
+} \
+
 #define UPSAMPLE_NEAREST2D_OP(TYPENAME, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t w_out, \
@@ -895,6 +1170,25 @@ extern "C" __global__ void FN_NAME(  \
     TYPENAME *dst \
 ) {  \
   upsample_nearest2d<TYPENAME>(w_out, h_out, w_scale, h_scale, info, src, dst); \
+} \
+
+#define UPSAMPLE_TRILINEAR3D_OP(TYPENAME, FN_NAME) \
+extern "C" __global__ void FN_NAME(  \
+    const size_t d_out, \
+    const size_t h_out, \
+    const size_t w_out, \
+    const bool align_corners, \
+    const bool has_scale_d, \
+    const double scale_d_factor, \
+    const bool has_scale_h, \
+    const double scale_h_factor, \
+    const bool has_scale_w, \
+    const double scale_w_factor, \
+    const size_t *info, \
+    const TYPENAME *src, \
+    TYPENAME *dst \
+) {  \
+  upsample_trilinear3d<TYPENAME>(d_out, h_out, w_out, align_corners, has_scale_d, scale_d_factor, has_scale_h, scale_h_factor, has_scale_w, scale_w_factor, info, src, dst); \
 } \
 
 #define UPSAMPLE_BILINEAR2D_OP(TYPENAME, FN_NAME) \
@@ -918,10 +1212,13 @@ CONV1D_OP(__nv_bfloat16, float, conv1d_bf16)
 CONV2D_OP(__nv_bfloat16, float, conv2d_bf16)
 CONVT1D_OP(__nv_bfloat16, float, conv_transpose1d_bf16)
 CONVT2D_OP(__nv_bfloat16, float, conv_transpose2d_bf16)
+CONVT3D_OP(__nv_bfloat16, float, conv_transpose3d_bf16)
 AVG_POOL2D_OP(__nv_bfloat16, float, avg_pool2d_bf16)
 MAX_POOL2D_OP(__nv_bfloat16, max_pool2d_bf16)
+MAX_POOL3D_OP(__nv_bfloat16, max_pool3d_bf16)
 UPSAMPLE_NEAREST2D_OP(__nv_bfloat16, upsample_nearest2d_bf16)
 UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, upsample_bilinear2d_bf16)
+UPSAMPLE_TRILINEAR3D_OP(__nv_bfloat16, upsample_trilinear3d_bf16)
 IM2COL_OP(__nv_bfloat16, im2col_bf16)
 IM2COL3D_OP(__nv_bfloat16, im2col3d_bf16)
 IM2COL1D_OP(__nv_bfloat16, im2col1d_bf16)
@@ -934,6 +1231,7 @@ COL2IM1D_OP(__nv_bfloat16, col2im1d_bf16)
 // CONVT2D_OP(__nv_fp8_e4m3, float, conv_transpose2d_f8_e5m)
 // AVG_POOL2D_OP(__nv_fp8_e4m3, float, avg_pool2d_f8_e5m)
 // MAX_POOL2D_OP(__nv_fp8_e4m3, max_pool2d_f8_e5m)
+// MAX_POOL3D_OP(__nv_fp8_e4m3, max_pool3d_f8_e5m)
 // UPSAMPLE_NEAREST2D_OP(__nv_fp8_e4m3, upsample_nearest2d_f8_e5m)
 // IM2COL_OP(__nv_fp8_e4m3, im2col_f8_e5m)
 // IM2COL1D_OP(__nv_fp8_e4m3, im2col1d_f8_e5m)
@@ -945,10 +1243,13 @@ CONV1D_OP(__half, float, conv1d_f16)
 CONV2D_OP(__half, float, conv2d_f16)
 CONVT1D_OP(__half, float, conv_transpose1d_f16)
 CONVT2D_OP(__half, float, conv_transpose2d_f16)
+CONVT3D_OP(__half, float, conv_transpose3d_f16)
 AVG_POOL2D_OP(__half, float, avg_pool2d_f16)
 MAX_POOL2D_OP(__half, max_pool2d_f16)
+MAX_POOL3D_OP(__half, max_pool3d_f16)
 UPSAMPLE_NEAREST2D_OP(__half, upsample_nearest2d_f16)
 UPSAMPLE_BILINEAR2D_OP(__half, upsample_bilinear2d_f16)
+UPSAMPLE_TRILINEAR3D_OP(__half, upsample_trilinear3d_f16)
 IM2COL_OP(__half, im2col_f16)
 IM2COL3D_OP(__half, im2col3d_f16)
 IM2COL1D_OP(__half, im2col1d_f16)
@@ -971,9 +1272,13 @@ CONVT1D_OP(uint8_t, uint8_t, conv_transpose1d_u8)
 CONVT1D_OP(uint32_t, uint32_t, conv_transpose1d_u32)
 
 CONVT2D_OP(float, float, conv_transpose2d_f32)
+CONVT3D_OP(float, float, conv_transpose3d_f32)
 CONVT2D_OP(double, double, conv_transpose2d_f64)
+CONVT3D_OP(double, double, conv_transpose3d_f64)
 CONVT2D_OP(uint8_t, uint8_t, conv_transpose2d_u8)
+CONVT3D_OP(uint8_t, uint8_t, conv_transpose3d_u8)
 CONVT2D_OP(uint32_t, uint32_t, conv_transpose2d_u32)
+CONVT3D_OP(uint32_t, uint32_t, conv_transpose3d_u32)
 
 AVG_POOL2D_OP(float, float, avg_pool2d_f32)
 AVG_POOL2D_OP(double, double, avg_pool2d_f64)
@@ -981,9 +1286,13 @@ AVG_POOL2D_OP(uint8_t, uint8_t, avg_pool2d_u8)
 AVG_POOL2D_OP(uint32_t, uint32_t, avg_pool2d_u32)
 
 MAX_POOL2D_OP(float, max_pool2d_f32)
+MAX_POOL3D_OP(float, max_pool3d_f32)
 MAX_POOL2D_OP(double, max_pool2d_f64)
+MAX_POOL3D_OP(double, max_pool3d_f64)
 MAX_POOL2D_OP(uint8_t, max_pool2d_u8)
+MAX_POOL3D_OP(uint8_t, max_pool3d_u8)
 MAX_POOL2D_OP(uint32_t, max_pool2d_u32)
+MAX_POOL3D_OP(uint32_t, max_pool3d_u32)
 
 UPSAMPLE_NEAREST2D_OP(float, upsample_nearest2d_f32)
 UPSAMPLE_NEAREST2D_OP(double, upsample_nearest2d_f64)
@@ -991,9 +1300,13 @@ UPSAMPLE_NEAREST2D_OP(uint8_t, upsample_nearest2d_u8)
 UPSAMPLE_NEAREST2D_OP(uint32_t, upsample_nearest2d_u32)
 
 UPSAMPLE_BILINEAR2D_OP(float, upsample_bilinear2d_f32)
+UPSAMPLE_TRILINEAR3D_OP(float, upsample_trilinear3d_f32)
 UPSAMPLE_BILINEAR2D_OP(double, upsample_bilinear2d_f64)
+UPSAMPLE_TRILINEAR3D_OP(double, upsample_trilinear3d_f64)
 UPSAMPLE_BILINEAR2D_OP(uint8_t, upsample_bilinear2d_u8)
+UPSAMPLE_TRILINEAR3D_OP(uint8_t, upsample_trilinear3d_u8)
 UPSAMPLE_BILINEAR2D_OP(uint32_t, upsample_bilinear2d_u32)
+UPSAMPLE_TRILINEAR3D_OP(uint32_t, upsample_trilinear3d_u32)
 
 IM2COL_OP(float, im2col_f32)
 IM2COL_OP(double, im2col_f64)

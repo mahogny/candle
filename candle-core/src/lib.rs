@@ -146,6 +146,22 @@ impl ToUsize2 for (usize, usize) {
     }
 }
 
+pub trait ToUsize3 {
+    fn to_usize3(self) -> (usize, usize, usize);
+}
+
+impl ToUsize3 for usize {
+    fn to_usize3(self) -> (usize, usize, usize) {
+        (self, self, self)
+    }
+}
+
+impl ToUsize3 for (usize, usize, usize) {
+    fn to_usize3(self) -> (usize, usize, usize) {
+        self
+    }
+}
+
 /// Defining a module with forward method using a single argument.
 pub trait Module {
     fn forward(&self, xs: &Tensor) -> Result<Tensor>;

@@ -17,7 +17,7 @@
 //! assert_eq!(ys.to_vec2::<f32>()?, &[[210.0, 430.0, 650.0]]);
 //! # Ok(()) }
 //! ```
-use candle::{Result, Tensor};
+use candle::{CpuStorage, Layout, Result, Shape, Tensor};
 
 #[derive(Clone, Debug)]
 pub struct Linear {
@@ -73,8 +73,102 @@ impl super::Module for Linear {
         };
         match &self.bias {
             None => Ok(x),
-            Some(bias) => x.broadcast_add(bias),
+            Some(bias) => bias_add_last_dim(&x, bias),
         }
+    }
+}
+
+#[derive(Debug)]
+struct BiasAddLastDim;
+
+impl candle::CustomOp2 for BiasAddLastDim {
+    fn name(&self) -> &'static str {
+        "bias-add-last-dim"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("bias-add-last-dim fast path is only implemented for cuda")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle::CudaStorage,
+        l1: &Layout,
+        s2: &candle::CudaStorage,
+        l2: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle::cuda_backend::{kernels, CudaStorage, CudaStorageSlice, WrapErr};
+
+        if s1.dtype() != candle::DType::F32 || s2.dtype() != candle::DType::F32 {
+            candle::bail!("bias-add-last-dim only supports f32")
+        }
+        let Some((o1, o2)) = l1.contiguous_offsets() else {
+            candle::bail!("bias-add-last-dim input must be contiguous")
+        };
+        let Some((b1, b2)) = l2.contiguous_offsets() else {
+            candle::bail!("bias-add-last-dim bias must be contiguous")
+        };
+        let dims = l1.dims();
+        let Some(&n_cols) = dims.last() else {
+            candle::bail!("bias-add-last-dim input must have rank greater than zero")
+        };
+        if l2.shape().elem_count() != n_cols {
+            candle::bail!("bias-add-last-dim bias length mismatch")
+        }
+        let src = s1.as_cuda_slice::<f32>()?.slice(o1..o2);
+        let bias = s2.as_cuda_slice::<f32>()?.slice(b1..b2);
+        let dev = s1.device();
+        let elem_count = l1.shape().elem_count();
+        // SAFETY: Set by running the kernel below.
+        let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+        let func = dev.get_or_load_func("bias_add_last_dim_f32", &kernels::BINARY)?;
+        let cfg = LaunchConfig::for_num_elems(elem_count as u32);
+        let mut builder = func.builder();
+        builder.arg(&src);
+        builder.arg(&bias);
+        builder.arg(&dst);
+        candle::builder_arg!(builder, elem_count);
+        candle::builder_arg!(builder, n_cols);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        let storage = CudaStorage {
+            slice: CudaStorageSlice::F32(dst),
+            device: dev.clone(),
+        };
+        Ok((storage, l1.shape().clone()))
+    }
+}
+
+fn can_use_cuda_bias_add_last_dim(xs: &Tensor, bias: &Tensor) -> bool {
+    let (xs_storage, xs_layout) = xs.storage_and_layout();
+    let (bias_storage, bias_layout) = bias.storage_and_layout();
+    matches!(
+        (&*xs_storage, &*bias_storage),
+        (candle::Storage::Cuda(_), candle::Storage::Cuda(_))
+    ) && xs_storage.dtype() == candle::DType::F32
+        && bias_storage.dtype() == candle::DType::F32
+        && xs_layout.contiguous_offsets().is_some()
+        && bias_layout.contiguous_offsets().is_some()
+        && xs_layout
+            .dims()
+            .last()
+            .is_some_and(|&n_cols| bias_layout.shape().elem_count() == n_cols)
+}
+
+fn bias_add_last_dim(xs: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    if can_use_cuda_bias_add_last_dim(xs, bias) {
+        xs.apply_op2_no_bwd(bias, &BiasAddLastDim)
+    } else {
+        xs.broadcast_add(bias)
     }
 }
 
@@ -110,5 +204,121 @@ pub fn linear_b(
         linear(in_dim, out_dim, vb)
     } else {
         linear_no_bias(in_dim, out_dim, vb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bias_add_last_dim, Linear};
+    use crate::Module;
+    use candle::{Device, Result, Tensor};
+
+    fn assert_close(lhs: &Tensor, rhs: &Tensor, threshold: f32) -> Result<()> {
+        let max_diff = (lhs - rhs)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .reshape(())?
+            .to_vec0::<f32>()?;
+        assert!(max_diff < threshold, "max_diff {max_diff}");
+        Ok(())
+    }
+
+    fn bias_add_last_dim_matches_broadcast_add_3d(device: &Device) -> Result<()> {
+        let xs = Tensor::from_vec(
+            (0..2 * 4 * 6)
+                .map(|i| (i as f32 % 17.) * 0.125 - 0.75)
+                .collect(),
+            (2, 4, 6),
+            device,
+        )?;
+        let bias = Tensor::from_vec((0..6).map(|i| i as f32 * 0.2 - 0.5).collect(), 6, device)?;
+        let actual = bias_add_last_dim(&xs, &bias)?;
+        let expected = xs.broadcast_add(&bias)?;
+        assert_close(&actual, &expected, 1e-6)
+    }
+
+    fn linear_bias_add_matches_broadcast_add_2d(device: &Device) -> Result<()> {
+        let xs = Tensor::from_vec(
+            (0..4 * 5).map(|i| (i as f32 % 13.) * 0.2 - 0.6).collect(),
+            (4, 5),
+            device,
+        )?;
+        let weight = Tensor::from_vec(
+            (0..3 * 5).map(|i| (i as f32 % 7.) * 0.125 - 0.25).collect(),
+            (3, 5),
+            device,
+        )?;
+        let bias = Tensor::new(&[-0.5f32, 0.25, 0.75], device)?;
+        let layer = Linear::new(weight.clone(), Some(bias.clone()));
+        let actual = layer.forward(&xs)?;
+        let expected = xs.matmul(&weight.t()?)?.broadcast_add(&bias)?;
+        assert_close(&actual, &expected, 1e-6)
+    }
+
+    fn linear_bias_add_matches_broadcast_add_4d(device: &Device) -> Result<()> {
+        let xs = Tensor::from_vec(
+            (0..2 * 3 * 4 * 5)
+                .map(|i| (i as f32 % 19.) * 0.1 - 0.9)
+                .collect(),
+            (2, 3, 4, 5),
+            device,
+        )?;
+        let weight = Tensor::from_vec(
+            (0..6 * 5).map(|i| (i as f32 % 11.) * 0.15 - 0.45).collect(),
+            (6, 5),
+            device,
+        )?;
+        let bias = Tensor::from_vec((0..6).map(|i| i as f32 * 0.2 - 0.5).collect(), 6, device)?;
+        let layer = Linear::new(weight.clone(), Some(bias.clone()));
+        let actual = layer.forward(&xs)?;
+        let expected = xs
+            .reshape((2 * 3 * 4, 5))?
+            .matmul(&weight.t()?)?
+            .reshape((2, 3, 4, ()))?
+            .broadcast_add(&bias)?;
+        assert_close(&actual, &expected, 1e-5)
+    }
+
+    #[test]
+    fn bias_add_last_dim_matches_broadcast_add_3d_cpu() -> Result<()> {
+        bias_add_last_dim_matches_broadcast_add_3d(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn bias_add_last_dim_matches_broadcast_add_3d_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        bias_add_last_dim_matches_broadcast_add_3d(&device)
+    }
+
+    #[test]
+    fn linear_bias_add_matches_broadcast_add_2d_cpu() -> Result<()> {
+        linear_bias_add_matches_broadcast_add_2d(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn linear_bias_add_matches_broadcast_add_2d_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        linear_bias_add_matches_broadcast_add_2d(&device)
+    }
+
+    #[test]
+    fn linear_bias_add_matches_broadcast_add_4d_cpu() -> Result<()> {
+        linear_bias_add_matches_broadcast_add_4d(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn linear_bias_add_matches_broadcast_add_4d_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        linear_bias_add_matches_broadcast_add_4d(&device)
     }
 }

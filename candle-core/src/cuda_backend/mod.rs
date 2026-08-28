@@ -934,6 +934,56 @@ impl Map2 for ConvTranspose1D<'_> {
     }
 }
 
+struct ConvTranspose3D<'a>(&'a crate::conv::ParamsConvTranspose3D);
+impl Map2 for ConvTranspose3D<'_> {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        inp_l: &Layout,
+        k: &CudaSlice<T>,
+        k_l: &Layout,
+        dev: &CudaDevice,
+    ) -> Result<CudaSlice<T>> {
+        // Kernel shape: (c_in_k, c_out, d_k, h_k, w_k)
+        // Input shape: (b_size, c_in, d_in, h_in, w_in)
+        let p = &self.0;
+        let (out_d, out_h, out_w) = (p.out_d(), p.out_h(), p.out_w());
+        let dst_el = p.c_out * out_d * out_h * out_w * p.b_size;
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let k = &k.slice(k_l.start_offset()..);
+        let shape = inp_l.shape();
+        let dims = shape.dims();
+        let el = shape.elem_count();
+
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func = dev.get_or_load_func(&kernel_name::<T>("conv_transpose3d"), &kernels::CONV)?;
+        let ds = if dims.len() == 5 {
+            [dims, inp_l.stride(), k_l.dims(), k_l.stride()].concat()
+        } else {
+            crate::bail!("unexpected input shape for conv_transpose3d {dims:?}")
+        };
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
+        let mut builder = func.builder();
+        barg!(builder, el);
+        barg!(builder, out_d);
+        barg!(builder, out_h);
+        barg!(builder, out_w);
+        barg!(builder, p.stride);
+        barg!(builder, p.padding);
+        barg!(builder, p.output_padding);
+        barg!(builder, p.dilation);
+        ds.builder_arg(&mut builder);
+        builder.arg(inp);
+        builder.arg(k);
+        builder.arg(&out);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(out)
+    }
+}
+
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
 impl Map2 for ConvTranspose2D<'_> {
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
@@ -986,6 +1036,58 @@ impl Map2 for ConvTranspose2D<'_> {
 enum PoolOp {
     Max,
     Avg,
+}
+
+struct MaxPool3D {
+    d_k: usize,
+    h_k: usize,
+    w_k: usize,
+    d_stride: usize,
+    h_stride: usize,
+    w_stride: usize,
+}
+
+impl Map1 for MaxPool3D {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        dev: &CudaDevice,
+        inp_l: &Layout,
+    ) -> Result<CudaSlice<T>> {
+        // Input shape: (b_size, c, d, h, w)
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let shape = inp_l.shape();
+        let dims = shape.dims();
+        let ds = if dims.len() == 5 {
+            [dims, inp_l.stride()].concat()
+        } else {
+            crate::bail!("unexpected input shape for max_pool3d {dims:?}")
+        };
+        let el = shape.elem_count();
+        let out_d = (dims[2] - self.d_k) / self.d_stride + 1;
+        let out_h = (dims[3] - self.h_k) / self.h_stride + 1;
+        let out_w = (dims[4] - self.w_k) / self.w_stride + 1;
+        let dst_el = out_d * out_h * out_w * dims[0] * dims[1];
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func = dev.get_or_load_func(&kernel_name::<T>("max_pool3d"), &kernels::CONV)?;
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
+        let mut builder = func.builder();
+        barg!(builder, el);
+        barg!(builder, self.d_k);
+        barg!(builder, self.h_k);
+        barg!(builder, self.w_k);
+        barg!(builder, self.d_stride);
+        barg!(builder, self.h_stride);
+        barg!(builder, self.w_stride);
+        ds.builder_arg(&mut builder);
+        builder.arg(inp);
+        builder.arg(&out);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(out)
+    }
 }
 
 struct Pool2D {
@@ -1074,6 +1176,63 @@ impl Map1 for UpsampleNearest2D {
         ds.builder_arg(&mut builder);
         builder.arg(inp);
         builder.arg(&out);
+        // SAFETY: ffi.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(out)
+    }
+}
+
+struct UpsampleTrilinear3D {
+    out_d: usize,
+    out_h: usize,
+    out_w: usize,
+    align_corners: bool,
+    scale_d_factor: Option<f64>,
+    scale_h_factor: Option<f64>,
+    scale_w_factor: Option<f64>,
+}
+
+impl Map1 for UpsampleTrilinear3D {
+    fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+        &self,
+        inp: &CudaSlice<T>,
+        dev: &CudaDevice,
+        inp_l: &Layout,
+    ) -> Result<CudaSlice<T>> {
+        let inp = &inp.slice(inp_l.start_offset()..);
+        let shape = inp_l.shape();
+        let dims = shape.dims();
+        let ds = if dims.len() == 5 {
+            [dims, inp_l.stride()].concat()
+        } else {
+            crate::bail!("unexpected input shape for upsample_trilinear3d {dims:?}")
+        };
+
+        let (out_d, out_h, out_w) = (self.out_d, self.out_h, self.out_w);
+        let dst_el = out_d * out_h * out_w * dims[0] * dims[1];
+        let cfg = LaunchConfig::for_num_elems(dst_el as u32);
+        let func =
+            dev.get_or_load_func(&kernel_name::<T>("upsample_trilinear3d"), &kernels::CONV)?;
+
+        // SAFETY: Set later by running the kernel.
+        let out = unsafe { dev.alloc::<T>(dst_el)? };
+        let ds = SlicePtrOrNull::params_from_vec(dev, ds)?;
+
+        let mut builder = func.builder();
+        barg!(builder, out_d);
+        barg!(builder, out_h);
+        barg!(builder, out_w);
+        barg!(builder, self.align_corners);
+        barg!(builder, self.scale_d_factor.is_some());
+        barg!(builder, self.scale_d_factor.unwrap_or(0.0));
+        barg!(builder, self.scale_h_factor.is_some());
+        barg!(builder, self.scale_h_factor.unwrap_or(0.0));
+        barg!(builder, self.scale_w_factor.is_some());
+        barg!(builder, self.scale_w_factor.unwrap_or(0.0));
+        ds.builder_arg(&mut builder);
+        builder.arg(inp);
+        builder.arg(&out);
+
         // SAFETY: ffi.
         unsafe { builder.launch(cfg) }.w()?;
         Ok(out)
@@ -2304,6 +2463,19 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    fn conv_transpose3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let slice =
+            ConvTranspose3D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice, device })
+    }
+
     fn conv_transpose2d(
         &self,
         l: &Layout,
@@ -2343,6 +2515,25 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    fn max_pool3d(
+        &self,
+        l: &Layout,
+        k: (usize, usize, usize),
+        stride: (usize, usize, usize),
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let slice = MaxPool3D {
+            d_k: k.0,
+            h_k: k.1,
+            w_k: k.2,
+            d_stride: stride.0,
+            h_stride: stride.1,
+            w_stride: stride.2,
+        }
+        .map(&self.slice, &device, l)?;
+        Ok(Self { slice, device })
+    }
+
     fn upsample_nearest1d(&self, _: &Layout, _out_sz: usize) -> Result<Self> {
         crate::bail!("upsample-nearest1d is not supported on cuda")
     }
@@ -2350,6 +2541,32 @@ impl BackendStorage for CudaStorage {
     fn upsample_nearest2d(&self, l: &Layout, out_w: usize, out_h: usize) -> Result<Self> {
         let device = self.device().clone();
         let slice = UpsampleNearest2D(out_w, out_h).map(&self.slice, &device, l)?;
+        Ok(Self { slice, device })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsample_trilinear3d(
+        &self,
+        l: &Layout,
+        out_d: usize,
+        out_h: usize,
+        out_w: usize,
+        align_corners: bool,
+        scale_d: Option<f64>,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        let slice = UpsampleTrilinear3D {
+            out_d,
+            out_h,
+            out_w,
+            align_corners,
+            scale_d_factor: scale_d,
+            scale_h_factor: scale_h,
+            scale_w_factor: scale_w,
+        }
+        .map(&self.slice, &device, l)?;
         Ok(Self { slice, device })
     }
 
@@ -2455,7 +2672,8 @@ impl BackendStorage for CudaStorage {
             (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
-                let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
+                let (cfg, _collapsed_lhs) =
+                    batch_broadcast_matmul_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
                 let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
                 unsafe { gemm_strided_batched_f32(&self.device.blas, cfg, rhs, lhs, &mut out) }
                     .w()?;
@@ -2464,7 +2682,8 @@ impl BackendStorage for CudaStorage {
             (CudaStorageSlice::F64(lhs), CudaStorageSlice::F64(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
-                let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
+                let (cfg, _collapsed_lhs) =
+                    batch_broadcast_matmul_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
                 let mut out = unsafe { dev.alloc::<f64>(elem_count)? };
                 unsafe {
                     self.device
@@ -2707,6 +2926,35 @@ impl BackendStorage for CudaStorage {
     }
 }
 
+fn batch_broadcast_matmul_config<T>(
+    alpha: T,
+    beta: T,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_l: &Layout,
+    rhs_l: &Layout,
+) -> Result<(StridedBatchedConfig<T>, Option<Layout>)>
+where
+    T: Copy,
+{
+    let cfg = gemm_config(alpha, beta, (b, m, n, k), lhs_l, rhs_l)?;
+    let lhs_stride = lhs_l.stride();
+    let can_collapse_broadcast_rhs = b > 1
+        && cfg.stride_a == 0
+        && cfg.stride_b == (m * k) as i64
+        && lhs_l.start_offset() == 0
+        && lhs_stride.len() >= 2
+        && lhs_stride[lhs_stride.len() - 1] == 1
+        && lhs_stride[lhs_stride.len() - 2] == k;
+
+    if can_collapse_broadcast_rhs {
+        let collapsed_lhs = Layout::contiguous((1, b * m, k));
+        let cfg = gemm_config(alpha, beta, (1, b * m, n, k), &collapsed_lhs, rhs_l)?;
+        Ok((cfg, Some(collapsed_lhs)))
+    } else {
+        Ok((cfg, None))
+    }
+}
+
 // Default for the reduced precision setting is false, similar to pytorch.
 // https://github.com/pytorch/pytorch/issues/123157
 static MM_F16_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
@@ -2762,11 +3010,11 @@ unsafe fn gemm_strided_batched_f32(
     use cudarc::cublas::sys;
     use cudarc::driver::DevicePtrMut;
 
-    let compute_type = if gemm_reduced_precision_f32() {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
-    } else {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
-    };
+    if !gemm_reduced_precision_f32() {
+        return cublas.gemm_strided_batched(cfg, a, b, c);
+    }
+
+    let compute_type = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32;
     let alpha = &cfg.gemm.alpha as *const f32 as *const _;
     let beta = &cfg.gemm.beta as *const f32 as *const _;
 
@@ -2918,4 +3166,69 @@ unsafe fn gemm_strided_batched_bf16(
         compute_type,
         sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Device, IndexOp, Result, Tensor};
+
+    #[test]
+    fn f32_matmul_broadcast_rhs_batch_stride_zero() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let lhs_data: Vec<_> = (0..8 * 4 * 5)
+            .map(|i| (i as f32 % 17.) * 0.125 - 1.)
+            .collect();
+        let rhs_data: Vec<_> = (0..5 * 3).map(|i| (i as f32 % 11.) * 0.25 - 0.75).collect();
+        let lhs = Tensor::from_vec(lhs_data, (8, 4, 5), &device)?;
+        let rhs = Tensor::from_vec(rhs_data, (1, 5, 3), &device)?;
+
+        let out = lhs.broadcast_matmul(&rhs)?;
+        assert_eq!(out.dims(), &[8, 4, 3]);
+
+        for batch_idx in 0..8 {
+            let actual = out.i(batch_idx)?;
+            let expected = lhs.i(batch_idx)?.matmul(&rhs.i(0)?)?;
+            let max_diff = (actual - expected)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .reshape(())?
+                .to_vec0::<f32>()?;
+            assert!(max_diff < 1e-5, "batch {batch_idx} max_diff {max_diff}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn f64_matmul_broadcast_rhs_batch_stride_zero() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let lhs_data: Vec<_> = (0..8 * 4 * 5)
+            .map(|i| (i as f64 % 17.) * 0.125 - 1.)
+            .collect();
+        let rhs_data: Vec<_> = (0..5 * 3).map(|i| (i as f64 % 11.) * 0.25 - 0.75).collect();
+        let lhs = Tensor::from_vec(lhs_data, (8, 4, 5), &device)?;
+        let rhs = Tensor::from_vec(rhs_data, (1, 5, 3), &device)?;
+
+        let out = lhs.broadcast_matmul(&rhs)?;
+        assert_eq!(out.dims(), &[8, 4, 3]);
+
+        for batch_idx in 0..8 {
+            let actual = out.i(batch_idx)?;
+            let expected = lhs.i(batch_idx)?.matmul(&rhs.i(0)?)?;
+            let max_diff = (actual - expected)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .reshape(())?
+                .to_vec0::<f64>()?;
+            assert!(max_diff < 1e-10, "batch {batch_idx} max_diff {max_diff}");
+        }
+
+        Ok(())
+    }
 }

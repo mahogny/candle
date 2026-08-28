@@ -1,6 +1,16 @@
 #include "binary_op_macros.cuh"
 #include<stdint.h>
 
+extern "C" __global__ void bias_add_last_dim_f32(
+    const float *src, const float *bias, float *dst,
+    const size_t numel, const size_t n_cols) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel) {
+    return;
+  }
+  dst[idx] = src[idx] + bias[idx % n_cols];
+}
+
 #if __CUDA_ARCH__ >= 800
 BINARY_OP(__nv_bfloat16, badd_bf16, x + y)
 BINARY_OP(__nv_bfloat16, bdiv_bf16, x / y)

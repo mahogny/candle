@@ -85,6 +85,11 @@ impl Tensor {
                         kernel: rhs,
                         ..
                     }
+                    | Op::ConvTranspose3D {
+                        arg: lhs,
+                        kernel: rhs,
+                        ..
+                    }
                     | Op::ConvTranspose2D {
                         arg: lhs,
                         kernel: rhs,
@@ -126,6 +131,8 @@ impl Tensor {
                     | Op::UpsampleBilinear2D { arg: node, .. }
                     | Op::AvgPool2D { arg: node, .. }
                     | Op::MaxPool2D { arg: node, .. }
+                    | Op::MaxPool3D { arg: node, .. }
+                    | Op::UpsampleTrilinear3D { arg: node, .. }
                     | Op::Copy(node)
                     | Op::Broadcast(node)
                     | Op::Cmp(node, _)
@@ -380,6 +387,15 @@ impl Tensor {
                         let grad_arg = ((grad * avg)?.upsample_nearest2d(h, w)? * mask)?;
                         let sum_grad = grads.or_insert(arg)?;
                         *sum_grad = sum_grad.add(&grad_arg)?;
+                    }
+                    Op::MaxPool3D { .. } => {
+                        crate::bail!("backward not supported for max_pool3d")
+                    }
+                    Op::ConvTranspose3D { .. } => {
+                        crate::bail!("backward not supported for conv_transpose3d")
+                    }
+                    Op::UpsampleTrilinear3D { .. } => {
+                        crate::bail!("backward not supported for upsample_trilinear3d")
                     }
                     Op::UpsampleNearest1D { arg, target_size } => {
                         let (_n, c, size) = arg.dims3()?;

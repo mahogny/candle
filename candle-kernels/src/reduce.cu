@@ -271,6 +271,78 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
     }
 }
 
+extern "C" __global__ void softmax_1024_f32(
+    const float *src, float *dst, const int n_cols) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    const int n_warps = blockDim.x / WARP_SIZE;
+    __shared__ float partial[32];
+
+    float max_val = -INFINITY;
+    for (int col = tid; col < n_cols; col += blockDim.x) {
+        max_val = maxg(max_val, src[row * n_cols + col]);
+    }
+
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        max_val = maxg(max_val, __shfl_xor_sync(0xffffffff, max_val, mask, WARP_SIZE));
+    }
+    if (lane_id == 0) {
+        partial[warp_id] = max_val;
+    }
+    __syncthreads();
+
+    max_val = tid < n_warps ? partial[lane_id] : -INFINITY;
+    if (warp_id == 0) {
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            max_val = maxg(max_val, __shfl_xor_sync(0xffffffff, max_val, mask, WARP_SIZE));
+        }
+    }
+    if (tid == 0) {
+        partial[0] = max_val;
+    }
+    __syncthreads();
+    max_val = partial[0];
+
+    float sum_val = 0.f;
+    for (int col = tid; col < n_cols; col += blockDim.x) {
+        const int i = row * n_cols + col;
+        const float val = expg(src[i] - max_val);
+        sum_val += val;
+        dst[i] = val;
+    }
+
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum_val += __shfl_xor_sync(0xffffffff, sum_val, mask, WARP_SIZE);
+    }
+    if (lane_id == 0) {
+        partial[warp_id] = sum_val;
+    }
+    __syncthreads();
+
+    sum_val = tid < n_warps ? partial[lane_id] : 0.f;
+    if (warp_id == 0) {
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum_val += __shfl_xor_sync(0xffffffff, sum_val, mask, WARP_SIZE);
+        }
+    }
+    if (tid == 0) {
+        partial[0] = 1.f / sum_val;
+    }
+    __syncthreads();
+    const float inv_sum = partial[0];
+
+    for (int col = tid; col < n_cols; col += blockDim.x) {
+        const int i = row * n_cols + col;
+        dst[i] *= inv_sum;
+    }
+}
+
 template <typename T>
 __device__ void ropei(const T * src, const T * cos, const T * sin, T * dst, const uint32_t bh, const uint32_t td, const uint32_t stride_b) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;

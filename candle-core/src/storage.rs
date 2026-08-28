@@ -492,6 +492,37 @@ impl Storage {
         }
     }
 
+    pub(crate) fn conv_transpose3d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose3D,
+    ) -> Result<Self> {
+        self.same_device(kernel, "conv_transpose3d")?;
+        self.same_dtype(kernel, "conv_transpose3d")?;
+        match (self, &kernel) {
+            (Storage::Cpu(inp), Storage::Cpu(kernel)) => {
+                let s = inp.conv_transpose3d(l, kernel, kernel_l, params)?;
+                Ok(Self::Cpu(s))
+            }
+            (Storage::Cuda(inp), Storage::Cuda(kernel)) => {
+                let s = inp.conv_transpose3d(l, kernel, kernel_l, params)?;
+                Ok(Self::Cuda(s))
+            }
+            (Storage::Metal(inp), Storage::Metal(kernel)) => {
+                let s = inp.conv_transpose3d(l, kernel, kernel_l, params)?;
+                Ok(Self::Metal(s))
+            }
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
+                lhs: lhs.device().location(),
+                rhs: rhs.device().location(),
+                op: "conv_transpose3d",
+            }
+            .bt()),
+        }
+    }
+
     pub(crate) fn conv_transpose2d(
         &self,
         l: &Layout,
@@ -567,6 +598,28 @@ impl Storage {
         }
     }
 
+    pub(crate) fn max_pool3d(
+        &self,
+        layout: &Layout,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.max_pool3d(layout, kernel_size, stride)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.max_pool3d(layout, kernel_size, stride)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.max_pool3d(layout, kernel_size, stride)?;
+                Ok(Self::Metal(storage))
+            }
+        }
+    }
+
     pub(crate) fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
         match self {
             Storage::Cpu(storage) => {
@@ -596,6 +649,61 @@ impl Storage {
             }
             Self::Metal(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Metal(storage))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsample_trilinear3d(
+        &self,
+        layout: &Layout,
+        target_d: usize,
+        target_h: usize,
+        target_w: usize,
+        align_corners: bool,
+        scale_d: Option<f64>,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage = storage.upsample_trilinear3d(
+                    layout,
+                    target_d,
+                    target_h,
+                    target_w,
+                    align_corners,
+                    scale_d,
+                    scale_h,
+                    scale_w,
+                )?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage = storage.upsample_trilinear3d(
+                    layout,
+                    target_d,
+                    target_h,
+                    target_w,
+                    align_corners,
+                    scale_d,
+                    scale_h,
+                    scale_w,
+                )?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage = storage.upsample_trilinear3d(
+                    layout,
+                    target_d,
+                    target_h,
+                    target_w,
+                    align_corners,
+                    scale_d,
+                    scale_h,
+                    scale_w,
+                )?;
                 Ok(Self::Metal(storage))
             }
         }
