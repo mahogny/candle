@@ -106,6 +106,31 @@ where
     }
 
     if lean {
+        if T::DTYPE == candle::DType::F32 {
+            let qshape = q.shape().dims();
+            let kshape = k.shape().dims();
+            let vshape = v.shape().dims();
+            // SAFETY: the runtime dtype guard above proves each generic slice
+            // is backed by f32 values for this specialized kernel.
+            let q =
+                unsafe { std::slice::from_raw_parts(q_data.as_ptr() as *const f32, q_data.len()) };
+            let k =
+                unsafe { std::slice::from_raw_parts(k_data.as_ptr() as *const f32, k_data.len()) };
+            let v =
+                unsafe { std::slice::from_raw_parts(v_data.as_ptr() as *const f32, v_data.len()) };
+            return flash_attn_prefill_f32(
+                q,
+                k,
+                v,
+                qshape,
+                kshape,
+                vshape,
+                q_stride,
+                k_stride,
+                v_stride,
+                softmax_scale,
+            );
+        }
         return flash_attn_prefill_lean::<T>(
             q_data,
             k_data,
@@ -134,6 +159,177 @@ where
         max_bias,
         logit_softcap,
     )
+}
+
+#[inline]
+fn dot_f32_scalar(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+#[inline]
+fn axpy_f32_scalar(acc: &mut [f32], value: &[f32], scale: f32) {
+    for (acc, value) in acc.iter_mut().zip(value) {
+        *acc += scale * value;
+    }
+}
+
+#[inline]
+fn scale_f32_scalar(acc: &mut [f32], scale: f32) {
+    for value in acc {
+        *value *= scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let mut sum = _mm256_setzero_ps();
+    let mut index = 0;
+    while index + 8 <= left.len() {
+        sum = _mm256_fmadd_ps(
+            _mm256_loadu_ps(left.as_ptr().add(index)),
+            _mm256_loadu_ps(right.as_ptr().add(index)),
+            sum,
+        );
+        index += 8;
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    lanes.into_iter().sum::<f32>() + dot_f32_scalar(&left[index..], &right[index..])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_f32_avx2(acc: &mut [f32], value: &[f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let scale = _mm256_set1_ps(scale);
+    let mut index = 0;
+    while index + 8 <= acc.len() {
+        let updated = _mm256_fmadd_ps(
+            scale,
+            _mm256_loadu_ps(value.as_ptr().add(index)),
+            _mm256_loadu_ps(acc.as_ptr().add(index)),
+        );
+        _mm256_storeu_ps(acc.as_mut_ptr().add(index), updated);
+        index += 8;
+    }
+    axpy_f32_scalar(&mut acc[index..], &value[index..], scale_f32(scale));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_f32_avx2(acc: &mut [f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let scale = _mm256_set1_ps(scale);
+    let mut index = 0;
+    while index + 8 <= acc.len() {
+        _mm256_storeu_ps(
+            acc.as_mut_ptr().add(index),
+            _mm256_mul_ps(_mm256_loadu_ps(acc.as_ptr().add(index)), scale),
+        );
+        index += 8;
+    }
+    scale_f32_scalar(&mut acc[index..], scale_f32(scale));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scale_f32(value: std::arch::x86_64::__m256) -> f32 {
+    std::arch::x86_64::_mm_cvtss_f32(std::arch::x86_64::_mm256_castps256_ps128(value))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flash_attn_prefill_f32(
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+    qshape: &[usize],
+    kshape: &[usize],
+    vshape: &[usize],
+    qstride: &[usize],
+    kstride: &[usize],
+    vstride: &[usize],
+    scale: f32,
+) -> Result<Tensor> {
+    let (q_len, heads, dim) = (qshape[1], qshape[2], qshape[3]);
+    let kv_len = kshape[1];
+    let key_heads = kshape[2];
+    let value_heads = vshape[2];
+    let key_ratio = heads / key_heads;
+    let value_ratio = heads / value_heads;
+    let avx2 = cfg!(target_arch = "x86_64")
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma");
+    let mut output = vec![0f32; heads * q_len * dim];
+    output
+        .par_chunks_mut(dim)
+        .with_min_len(64)
+        .enumerate()
+        .for_each_init(
+            || vec![0f32; dim],
+            |acc, (row, output)| {
+                let head = row / q_len;
+                let query_pos = row % q_len;
+                let query_base = query_pos * qstride[1] + head * qstride[2];
+                let query = &q_data[query_base..query_base + dim];
+                let mut max = f32::NEG_INFINITY;
+                let mut sum = 0f32;
+                for key_pos in 0..kv_len {
+                    let key_base = key_pos * kstride[1] + (head / key_ratio) * kstride[2];
+                    let key = &k_data[key_base..key_base + dim];
+                    let score = {
+                        #[cfg(target_arch = "x86_64")]
+                        if avx2 {
+                            unsafe { dot_f32_avx2(query, key) }
+                        } else {
+                            dot_f32_scalar(query, key)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            dot_f32_scalar(query, key)
+                        }
+                    } * scale;
+                    let rescale = if score > max {
+                        let factor = (max - score).exp();
+                        max = score;
+                        factor
+                    } else {
+                        1.
+                    };
+                    if rescale != 1. {
+                        #[cfg(target_arch = "x86_64")]
+                        if avx2 {
+                            unsafe { scale_f32_avx2(acc, rescale) }
+                        } else {
+                            scale_f32_scalar(acc, rescale)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        scale_f32_scalar(acc, rescale);
+                    }
+                    let weight = (score - max).exp();
+                    let value_base = key_pos * vstride[1] + (head / value_ratio) * vstride[2];
+                    let value = &v_data[value_base..value_base + dim];
+                    #[cfg(target_arch = "x86_64")]
+                    if avx2 {
+                        unsafe { axpy_f32_avx2(acc, value, weight) }
+                    } else {
+                        axpy_f32_scalar(acc, value, weight)
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    axpy_f32_scalar(acc, value, weight);
+                    sum = sum * rescale + weight;
+                }
+                let inverse = 1. / sum;
+                for (output, value) in output.iter_mut().zip(acc) {
+                    *output = *value * inverse;
+                }
+            },
+        );
+    Tensor::from_vec(output, (1usize, heads, q_len, dim), &Device::Cpu)
 }
 
 #[allow(clippy::too_many_arguments)]
