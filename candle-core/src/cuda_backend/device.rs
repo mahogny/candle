@@ -63,8 +63,17 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    blas_lt: Arc<cudarc::cublaslt::CudaBlasLT>,
     curand: Arc<Mutex<CudaRng>>,
     seed_value: Arc<RwLock<u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaMemoryPoolStats {
+    pub used_current: u64,
+    pub used_high: u64,
+    pub reserved_current: u64,
+    pub reserved_high: u64,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -289,6 +298,10 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    pub fn cublas_lt(&self) -> &cudarc::cublaslt::CudaBlasLT {
+        &self.blas_lt
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
@@ -305,6 +318,79 @@ impl CudaDevice {
 
     pub fn is_event_tracking(&self) -> bool {
         self.context.is_event_tracking()
+    }
+
+    /// Sets how many unused bytes CUDA's stream-ordered memory pool may retain
+    /// across synchronization points before returning memory to the driver.
+    ///
+    /// A non-zero threshold can avoid repeated physical allocations in
+    /// inference loops that synchronize between iterations. The retained
+    /// bytes remain charged to the process, so callers should choose a bounded
+    /// value appropriate for their device and expose it in memory metrics.
+    pub fn set_memory_pool_release_threshold(&self, bytes: u64) -> Result<()> {
+        use cudarc::driver::{result, sys};
+
+        self.context.bind_to_thread().w()?;
+        let device = result::device::get(self.context.ordinal() as i32).w()?;
+        let pool = unsafe { result::device::get_mem_pool(device) }.w()?;
+        let mut value = bytes;
+        unsafe {
+            result::mem_pool::set_attribute(
+                pool,
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                (&mut value as *mut u64).cast(),
+            )
+        }
+        .w()
+    }
+
+    /// Returns live and high-water bytes reported by CUDA's stream-ordered
+    /// memory pool. `used` is memory checked out to allocations; `reserved`
+    /// also includes reusable blocks retained by the pool.
+    pub fn memory_pool_stats(&self) -> Result<CudaMemoryPoolStats> {
+        use cudarc::driver::{result, sys};
+
+        self.context.bind_to_thread().w()?;
+        let device = result::device::get(self.context.ordinal() as i32).w()?;
+        let pool = unsafe { result::device::get_mem_pool(device) }.w()?;
+        let read = |attribute| -> Result<u64> {
+            let mut value = 0u64;
+            unsafe {
+                result::mem_pool::get_attribute(pool, attribute, (&mut value as *mut u64).cast())
+            }
+            .w()?;
+            Ok(value)
+        };
+        Ok(CudaMemoryPoolStats {
+            used_current: read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+            used_high: read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+            reserved_current: read(
+                sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            )?,
+            reserved_high: read(sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+        })
+    }
+
+    /// Resets the CUDA memory-pool used/reserved high-water marks to the
+    /// current live values. Existing allocations and retained blocks are not
+    /// released.
+    pub fn reset_memory_pool_peak_stats(&self) -> Result<()> {
+        use cudarc::driver::{result, sys};
+
+        self.context.bind_to_thread().w()?;
+        let device = result::device::get(self.context.ordinal() as i32).w()?;
+        let pool = unsafe { result::device::get_mem_pool(device) }.w()?;
+        for attribute in [
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+        ] {
+            let mut value = 0u64;
+            unsafe {
+                result::mem_pool::set_attribute(pool, attribute, (&mut value as *mut u64).cast())
+            }
+            .w()?;
+        }
+        Ok(())
     }
 
     #[cfg(all(feature = "ug", not(target_arch = "wasm32")))]
@@ -395,6 +481,8 @@ impl CudaDevice {
         stream: Arc<cudarc::driver::CudaStream>,
     ) -> Result<Self> {
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let blas_lt = cudarc::cublaslt::CudaBlasLT::new(stream.clone())
+            .map_err(|err| crate::Error::Msg(format!("cuBLASLt initialization failed: {err}")))?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
@@ -404,6 +492,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            blas_lt: Arc::new(blas_lt),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

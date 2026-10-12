@@ -1,6 +1,6 @@
 //! 1D, 2D, and 3D Convolutions
 //!
-use crate::{op::BackpropOp, op::Op, Error, Result, Tensor};
+use crate::{op::BackpropOp, op::Op, DType, Error, Result, Tensor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamsConv1D {
@@ -77,6 +77,7 @@ pub struct ParamsConv2D {
     pub(crate) k_w: usize,
     pub(crate) c_out: usize,
     pub(crate) c_in: usize,
+    pub(crate) groups: usize,
     pub(crate) padding: usize,
     pub(crate) stride: usize,
     pub(crate) dilation: usize,
@@ -216,7 +217,205 @@ impl ParamsConvTranspose3D {
     }
 }
 
+#[derive(Debug)]
+struct ConvTranspose2dBiasCpu(ParamsConvTranspose2D);
+
+impl crate::CustomOp3 for ConvTranspose2dBiasCpu {
+    fn name(&self) -> &'static str {
+        "conv-transpose2d-bias-cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        input: &crate::CpuStorage,
+        input_layout: &crate::Layout,
+        weight: &crate::CpuStorage,
+        weight_layout: &crate::Layout,
+        bias: &crate::CpuStorage,
+        bias_layout: &crate::Layout,
+    ) -> Result<(crate::CpuStorage, crate::Shape)> {
+        let (
+            crate::CpuStorage::F32(input),
+            crate::CpuStorage::F32(weight),
+            crate::CpuStorage::F32(bias),
+        ) = (input, weight, bias)
+        else {
+            crate::bail!("fused transposed convolution requires CPU f32 tensors")
+        };
+        let Some((bias_start, bias_end)) = bias_layout.contiguous_offsets() else {
+            crate::bail!("fused transposed convolution requires contiguous bias")
+        };
+        let bias = &bias[bias_start..bias_end];
+        if bias.len() != self.0.c_out {
+            crate::bail!("fused transposed convolution bias shape mismatch")
+        }
+        let output = crate::cpu_backend::conv_transpose2d_stride2_kernel2_f32(
+            &self.0,
+            input,
+            input_layout,
+            weight,
+            weight_layout,
+            Some(bias),
+            None,
+        )?;
+        Ok((
+            crate::CpuStorage::F32(output),
+            crate::Shape::from_dims(&self.0.out_dims()),
+        ))
+    }
+}
+
 impl Tensor {
+    /// Inference-only CPU f32 path that writes the bias into the final output
+    /// of a non-overlapping 2x2/stride-2 transposed convolution. Other shapes
+    /// and devices return `None` so callers can use the ordinary operation.
+    pub fn conv_transpose2d_bias_cpu(
+        &self,
+        kernel: &Self,
+        bias: &Self,
+        padding: usize,
+        output_padding: usize,
+        stride: usize,
+        dilation: usize,
+    ) -> Result<Option<Self>> {
+        if !self.device().is_cpu()
+            || !kernel.device().is_cpu()
+            || !bias.device().is_cpu()
+            || self.dtype() != DType::F32
+            || kernel.dtype() != DType::F32
+            || bias.dtype() != DType::F32
+            || padding != 0
+            || output_padding != 0
+            || stride != 2
+            || dilation != 1
+        {
+            return Ok(None);
+        }
+        let (b_size, c_in, i_h, i_w) = self.dims4()?;
+        let (c_in_k, c_out, k_h, k_w) = kernel.dims4()?;
+        if c_in != c_in_k || k_h != 2 || k_w != 2 || bias.dims1()? != c_out {
+            return Ok(None);
+        }
+        let params = ParamsConvTranspose2D {
+            b_size,
+            i_h,
+            i_w,
+            k_h,
+            k_w,
+            c_out,
+            c_in,
+            padding,
+            output_padding,
+            stride,
+            dilation,
+        };
+        Ok(Some(self.apply_op3_no_bwd(
+            kernel,
+            bias,
+            &ConvTranspose2dBiasCpu(params),
+        )?))
+    }
+
+    /// Inference-only CPU f32 path writing `(convolution + bias) + residual`
+    /// directly into the NCHW result. No intermediate convolution result or
+    /// output-sized broadcast-add tensor is created.
+    pub fn conv_transpose2d_bias_residual_cpu(
+        &self,
+        kernel: &Self,
+        bias: &Self,
+        residual: &Self,
+        padding: usize,
+        output_padding: usize,
+        stride: usize,
+        dilation: usize,
+    ) -> Result<Option<Self>> {
+        if !self.device().is_cpu()
+            || !kernel.device().is_cpu()
+            || !bias.device().is_cpu()
+            || !residual.device().is_cpu()
+            || self.dtype() != DType::F32
+            || kernel.dtype() != DType::F32
+            || bias.dtype() != DType::F32
+            || residual.dtype() != DType::F32
+            || padding != 0
+            || output_padding != 0
+            || stride != 2
+            || dilation != 1
+        {
+            return Ok(None);
+        }
+        let (b_size, c_in, i_h, i_w) = self.dims4()?;
+        let (c_in_k, c_out, k_h, k_w) = kernel.dims4()?;
+        if c_in != c_in_k
+            || k_h != 2
+            || k_w != 2
+            || bias.dims1()? != c_out
+            || (residual.dims() != [b_size, c_out, i_h * 2, i_w * 2]
+                && residual.dims() != [1, c_out, i_h * 2, i_w * 2])
+        {
+            return Ok(None);
+        }
+        let params = ParamsConvTranspose2D {
+            b_size,
+            i_h,
+            i_w,
+            k_h,
+            k_w,
+            c_out,
+            c_in,
+            padding,
+            output_padding,
+            stride,
+            dilation,
+        };
+        let (input_storage, input_layout) = self.storage_and_layout();
+        let (kernel_storage, kernel_layout) = kernel.storage_and_layout();
+        let (bias_storage, bias_layout) = bias.storage_and_layout();
+        let (residual_storage, residual_layout) = residual.storage_and_layout();
+        let (
+            crate::Storage::Cpu(crate::CpuStorage::F32(input)),
+            crate::Storage::Cpu(crate::CpuStorage::F32(weight)),
+            crate::Storage::Cpu(crate::CpuStorage::F32(bias)),
+            crate::Storage::Cpu(crate::CpuStorage::F32(residual)),
+        ) = (
+            &*input_storage,
+            &*kernel_storage,
+            &*bias_storage,
+            &*residual_storage,
+        )
+        else {
+            return Ok(None);
+        };
+        let (Some((bias_start, bias_end)), Some((residual_start, residual_end))) = (
+            bias_layout.contiguous_offsets(),
+            residual_layout.contiguous_offsets(),
+        ) else {
+            return Ok(None);
+        };
+        let bias = &bias[bias_start..bias_end];
+        let residual = &residual[residual_start..residual_end];
+        let output_batch_elements = c_out * i_h * i_w * 4;
+        if bias.len() != c_out
+            || (residual.len() != b_size * output_batch_elements
+                && residual.len() != output_batch_elements)
+        {
+            return Ok(None);
+        }
+        let output = crate::cpu_backend::conv_transpose2d_stride2_kernel2_f32(
+            &params,
+            input,
+            input_layout,
+            weight,
+            kernel_layout,
+            Some(bias),
+            Some(residual),
+        )?;
+        Ok(Some(Self::from_vec(
+            output,
+            (b_size, c_out, i_h * 2, i_w * 2),
+            self.device(),
+        )?))
+    }
     fn conv1d_single_group(&self, kernel: &Self, params: &ParamsConv1D) -> Result<Self> {
         let storage =
             self.storage()
@@ -401,20 +600,45 @@ impl Tensor {
                 "in_channel mismatch between input ({c_in}, groups {groups}) and kernel ({c_in_k})"
             )
         }
+        // cuDNN supports grouped convolution directly. The generic Candle path
+        // historically split groups into independent tensors, which turns a
+        // 256-channel depthwise convolution into 256 launches plus a concat.
+        // Keep that decomposition for backprop and non-cuDNN backends until
+        // their native grouped gradients/storage implementations are present.
+        #[cfg(feature = "cudnn")]
+        let native_cuda_grouped = groups > 1 && self.device().is_cuda();
+        #[cfg(not(feature = "cudnn"))]
+        let native_cuda_grouped = false;
+        // The CPU backend has a direct depthwise kernel. Keeping the complete
+        // tensor intact avoids creating and dispatching one convolution per
+        // channel (256 separate tensors in SAM2's memory encoder).
+        let native_cpu_depthwise = self.device().is_cpu()
+            && self.dtype() == DType::F32
+            && groups == c_in
+            && groups == c_out
+            && std::env::var_os("CANDLE_CPU_NATIVE_DEPTHWISE").is_none_or(|value| value != "0");
+        let native_grouped =
+            (native_cuda_grouped || native_cpu_depthwise) && !self.track_op() && !kernel.track_op();
+        let (params_c_out, params_c_in, params_groups) = if native_grouped {
+            (c_out, c_in, groups)
+        } else {
+            (c_out / groups, c_in / groups, 1)
+        };
         let params = ParamsConv2D {
             b_size,
             i_h,
             i_w,
             k_h,
             k_w,
-            c_out: c_out / groups,
-            c_in: c_in / groups,
+            c_out: params_c_out,
+            c_in: params_c_in,
+            groups: params_groups,
             padding,
             stride,
             dilation,
             cudnn_fwd_algo,
         };
-        if groups == 1 {
+        if groups == 1 || native_grouped {
             self.conv2d_single_group(kernel, &params)
         } else {
             let blocks = self.chunk(groups, 1)?;

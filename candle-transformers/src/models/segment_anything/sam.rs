@@ -15,6 +15,19 @@ const STABILITY_SCORE_THRESHOLD: f32 = 0.95;
 const MODEL_MASK_THRESHOLD: f32 = 0.0;
 const CROP_NMS_THRESH: f32 = 0.7;
 
+/// Detached image and prompt features consumed by the SAM1 mask decoder.
+///
+/// Keeping this boundary in the faithful SAM translation lets native trainers optimize only the
+/// decoder while reusing image embeddings across epochs. The tensors deliberately expose no
+/// model-specific parameter storage.
+#[derive(Debug)]
+pub struct FrozenDecoderInputs {
+    pub image_embeddings: Tensor,
+    pub image_pe: Tensor,
+    pub sparse_prompt_embeddings: Tensor,
+    pub dense_prompt_embeddings: Tensor,
+}
+
 #[derive(Debug)]
 enum ImageEncoder {
     Original(Box<ImageEncoderViT>),
@@ -163,6 +176,59 @@ impl Sam {
         points: &[(f64, f64, bool)],
         multimask_output: bool,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_for_embeddings_with_prompts(
+            img_embeddings,
+            original_h,
+            original_w,
+            points,
+            None,
+            None,
+            multimask_output,
+        )
+    }
+
+    /// Decode cached embeddings with the full original SAM prompt surface. Point and box
+    /// coordinates are normalized to the unpadded resized image. `mask_input`, when present, is
+    /// the standard Bx1x256x256 low-resolution logit prompt.
+    pub fn forward_for_embeddings_with_prompts(
+        &self,
+        img_embeddings: &Tensor,
+        original_h: usize,
+        original_w: usize,
+        points: &[(f64, f64, bool)],
+        bounding_box: Option<[f64; 4]>,
+        mask_input: Option<&Tensor>,
+        multimask_output: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let inputs = self.frozen_decoder_inputs(
+            img_embeddings,
+            original_h,
+            original_w,
+            points,
+            bounding_box,
+            mask_input,
+        )?;
+        self.mask_decoder.forward(
+            &inputs.image_embeddings,
+            &inputs.image_pe,
+            &inputs.sparse_prompt_embeddings,
+            &inputs.dense_prompt_embeddings,
+            multimask_output,
+        )
+    }
+
+    /// Encode prompts for a cached image and detach every decoder input from the frozen encoder
+    /// and prompt encoder graphs. This is also useful to inference callers that repeatedly compare
+    /// decoder revisions on the exact same inputs.
+    pub fn frozen_decoder_inputs(
+        &self,
+        img_embeddings: &Tensor,
+        original_h: usize,
+        original_w: usize,
+        points: &[(f64, f64, bool)],
+        bounding_box: Option<[f64; 4]>,
+        mask_input: Option<&Tensor>,
+    ) -> Result<FrozenDecoderInputs> {
         let image_pe = self.prompt_encoder.get_dense_pe()?;
         let points = if points.is_empty() {
             None
@@ -185,13 +251,41 @@ impl Sam {
             Some((points, labels))
         };
         let points = points.as_ref().map(|xy| (&xy.0, &xy.1));
+        let boxes = bounding_box
+            .map(|bounds| {
+                Tensor::new(
+                    &[[
+                        (bounds[0] * original_w as f64) as f32,
+                        (bounds[1] * original_h as f64) as f32,
+                        (bounds[2] * original_w as f64) as f32,
+                        (bounds[3] * original_h as f64) as f32,
+                    ]],
+                    img_embeddings.device(),
+                )
+            })
+            .transpose()?;
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
-            self.prompt_encoder.forward(points, None, None)?;
+            self.prompt_encoder
+                .forward(points, boxes.as_ref(), mask_input)?;
+        Ok(FrozenDecoderInputs {
+            image_embeddings: img_embeddings.detach(),
+            image_pe: image_pe.detach(),
+            sparse_prompt_embeddings: sparse_prompt_embeddings.detach(),
+            dense_prompt_embeddings: dense_prompt_embeddings.detach(),
+        })
+    }
+
+    /// Decode already frozen features with this model's mask decoder.
+    pub fn decode_frozen(
+        &self,
+        inputs: &FrozenDecoderInputs,
+        multimask_output: bool,
+    ) -> Result<(Tensor, Tensor)> {
         self.mask_decoder.forward(
-            img_embeddings,
-            &image_pe,
-            &sparse_prompt_embeddings,
-            &dense_prompt_embeddings,
+            &inputs.image_embeddings,
+            &inputs.image_pe,
+            &inputs.sparse_prompt_embeddings,
+            &inputs.dense_prompt_embeddings,
             multimask_output,
         )
     }

@@ -1,6 +1,6 @@
 use crate::WithDType;
 use cudarc;
-use cudarc::cudnn::safe::{ConvForward, Cudnn};
+use cudarc::cudnn::safe::{ConvBackwardData, ConvForward, Cudnn};
 use cudarc::driver::{CudaSlice, CudaView, DeviceRepr, ValidAsZeroBits};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -49,12 +49,13 @@ pub(crate) fn launch_conv2d<
         }
         c
     })?;
-    let conv = cudnn.create_conv2d::<Y>(
+    let mut conv = cudnn.create_conv2d::<Y>(
         /* pad */ [params.padding as i32, params.padding as i32],
         /* stride */ [params.stride as i32, params.stride as i32],
         /* dilation */ [params.dilation as i32, params.dilation as i32],
         cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
     )?;
+    conv.set_group_count(params.groups as i32)?;
     let x_shape = [
         params.b_size as i32,
         params.c_in as i32,
@@ -78,7 +79,7 @@ pub(crate) fn launch_conv2d<
         cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
         [
             params.c_out as i32,
-            params.c_in as i32,
+            (params.c_in / params.groups) as i32,
             params.k_h as i32,
             params.k_w as i32,
         ],
@@ -118,6 +119,94 @@ pub(crate) fn launch_conv2d<
             src,
             filter,
             dst,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn launch_conv_transpose2d<
+    T: DeviceRepr + WithDType + ValidAsZeroBits + cudarc::cudnn::CudnnDataType,
+    Y: cudarc::cudnn::CudnnDataType,
+>(
+    src: &CudaView<T>,
+    src_l: &crate::Layout,
+    filter: &CudaView<T>,
+    dst: &mut CudaSlice<T>,
+    params: &crate::conv::ParamsConvTranspose2D,
+    dev: &crate::cuda_backend::CudaDevice,
+) -> crate::Result<()> {
+    let device_id = dev.id();
+    let cudnn = CUDNN.with(|cudnn| {
+        if let Some(cudnn) = cudnn.borrow().get(&device_id) {
+            return Ok(cudnn.clone());
+        }
+        let c = Cudnn::new(dev.cuda_stream());
+        if let Ok(c) = &c {
+            cudnn.borrow_mut().insert(device_id, c.clone());
+        }
+        c
+    })?;
+    let conv = cudnn.create_conv2d::<Y>(
+        [params.padding as i32, params.padding as i32],
+        [params.stride as i32, params.stride as i32],
+        [params.dilation as i32, params.dilation as i32],
+        cudarc::cudnn::sys::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
+    )?;
+    let dy_shape = [
+        params.b_size as i32,
+        params.c_in as i32,
+        params.i_h as i32,
+        params.i_w as i32,
+    ];
+    let dy = if src_l.is_contiguous() {
+        cudnn.create_4d_tensor::<T>(
+            cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+            dy_shape,
+        )?
+    } else {
+        let s = src_l.stride();
+        cudnn.create_4d_tensor_ex::<T>(
+            dy_shape,
+            [s[0] as i32, s[1] as i32, s[2] as i32, s[3] as i32],
+        )?
+    };
+    // PyTorch/Candle transposed-convolution weights are Cin x Cout x Kh x Kw,
+    // exactly the filter layout consumed by cuDNN convolution backward-data.
+    let w = cudnn.create_4d_filter::<T>(
+        cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+        [
+            params.c_in as i32,
+            params.c_out as i32,
+            params.k_h as i32,
+            params.k_w as i32,
+        ],
+    )?;
+    let dx = cudnn.create_4d_tensor::<T>(
+        cudarc::cudnn::sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW,
+        [
+            params.b_size as i32,
+            params.c_out as i32,
+            params.out_h() as i32,
+            params.out_w() as i32,
+        ],
+    )?;
+    let operation = ConvBackwardData {
+        conv: &conv,
+        dx: &dx,
+        w: &w,
+        dy: &dy,
+    };
+    let algorithm = operation.pick_algorithm()?;
+    let workspace_size = operation.get_workspace_size(algorithm)?;
+    let mut workspace = dev.cuda_stream().alloc_zeros::<u8>(workspace_size)?;
+    unsafe {
+        operation.launch::<CudaSlice<u8>, _, _, _>(
+            algorithm,
+            Some(&mut workspace),
+            (T::one(), T::zero()),
+            dst,
+            filter,
+            src,
         )?;
     }
     Ok(())

@@ -103,9 +103,17 @@ where
         AttnMask::Causal { kv_offset } => {
             causal::run_causal_attn_cpu::<T>(q, k, v, softmax_scale, kv_offset, max_bias, softcap)
         }
-        AttnMask::None => {
-            standard::run_flash_attn_cpu::<T>(q, k, v, None, softmax_scale, max_bias, softcap)
-        }
+        AttnMask::None => standard::run_flash_attn_cpu::<T>(
+            q,
+            k,
+            v,
+            None,
+            softmax_scale,
+            max_bias,
+            softcap,
+            false,
+            false,
+        ),
         AttnMask::Mask(mask) => standard::run_flash_attn_cpu::<T>(
             q,
             k,
@@ -114,8 +122,87 @@ where
             softmax_scale,
             max_bias,
             softcap,
+            false,
+            false,
         ),
     }
+}
+
+/// CPU f32 flash attention that writes the result in `(B, S, H, D)` order.
+///
+/// This is an unmasked B=1 prefill specialization. It avoids the otherwise
+/// required `(B, H, S, D)` permutation followed by a materializing reshape in
+/// consumers whose next operation expects NHSD-contiguous activations.
+pub fn flash_attn_nhsd_f32(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    if q.dims()[0] != 1 {
+        candle::bail!("NHSD flash-attention is B=1 only (got B={})", q.dims()[0]);
+    }
+    standard::run_flash_attn_cpu::<f32>(q, k, v, None, softmax_scale, None, None, true, false)
+}
+
+/// CPU f32 decoder attention using the bounded blocked kernel and returning
+/// `(B, S, H, D)` output.
+///
+/// This explicit entry point lets callers select the PyTorch-like online
+/// blocked reduction only for decoder layers where its numerical order or
+/// performance is beneficial, without changing global dispatch.
+pub fn flash_attn_nhsd_f32_decoder_blocked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    if q.dims()[0] != 1 {
+        candle::bail!(
+            "blocked decoder NHSD flash-attention is B=1 only (got B={})",
+            q.dims()[0]
+        );
+    }
+    standard::run_flash_attn_cpu::<f32>(q, k, v, None, softmax_scale, None, None, true, true)
+}
+
+/// CPU f32 unmasked prefill attention in `(B, S, H, D)` order.
+///
+/// Unlike [`flash_attn_nhsd_f32`], this accepts independent batch entries.
+/// It is intended for batched short windows and indexes their existing NHSD
+/// storage directly, avoiding the varlen pack/unpack path.
+pub fn flash_attn_nhsd_f32_batched(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    softmax_scale: f32,
+) -> Result<Tensor> {
+    let q_dims = q.dims();
+    let k_dims = k.dims();
+    let v_dims = v.dims();
+    if q.dtype() != DType::F32
+        || k.dtype() != DType::F32
+        || v.dtype() != DType::F32
+        || q_dims.len() != 4
+        || k_dims.len() != 4
+        || v_dims.len() != 4
+        || q_dims[0] != k_dims[0]
+        || q_dims[0] != v_dims[0]
+        || q_dims[3] != k_dims[3]
+        || q_dims[3] != v_dims[3]
+        || k_dims[2] == 0
+        || v_dims[2] == 0
+        || q_dims[2] % k_dims[2] != 0
+        || q_dims[2] % v_dims[2] != 0
+        || q.stride()[3] != 1
+        || k.stride()[3] != 1
+        || v.stride()[3] != 1
+    {
+        candle::bail!(
+            "batched NHSD flash-attention requires compatible f32 rank-4 inputs with a contiguous final dimension"
+        );
+    }
+    standard::run_flash_attn_cpu::<f32>(q, k, v, None, softmax_scale, None, None, true, false)
 }
 
 /// Reshape batched (B,S,H,D) tensors into packed varlen format and dispatch.

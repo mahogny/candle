@@ -3,8 +3,11 @@ pub mod varlen;
 
 use candle::Tensor;
 
-pub use cpu_flash::flash_attn;
 pub use cpu_flash::varlen::flash_attn_varlen_cpu;
+pub use cpu_flash::{
+    flash_attn, flash_attn_nhsd_f32, flash_attn_nhsd_f32_batched,
+    flash_attn_nhsd_f32_decoder_blocked,
+};
 pub use varlen::flash_attn_varlen_unfused;
 
 #[derive(Debug, Clone, Default)]

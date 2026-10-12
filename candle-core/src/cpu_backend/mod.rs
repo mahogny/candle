@@ -435,11 +435,10 @@ impl Map1 for MaxPool3D {
                                         let l = s_d * d_idx + l;
                                         let m = s_h * h_idx + m;
                                         let n = s_w * w_idx + n;
-                                        let value =
-                                            src[src_index
-                                                + l * stride_d
-                                                + m * stride_h
-                                                + n * stride_w];
+                                        let value = src[src_index
+                                            + l * stride_d
+                                            + m * stride_h
+                                            + n * stride_w];
                                         if largest < value {
                                             largest = value
                                         }
@@ -596,8 +595,7 @@ impl Map1 for UpsampleTrilinear3D {
                     for &(h0, h1, wh) in h_indices.iter() {
                         for &(w0, w1, ww) in w_indices.iter() {
                             let at = |d: usize, h: usize, w: usize| {
-                                src[base + d * stride_d + h * stride_h + w * stride_w]
-                                    .to_f64()
+                                src[base + d * stride_d + h * stride_h + w * stride_w].to_f64()
                             };
                             let c00 = at(d0, h0, w0) * (1.0 - ww) + at(d0, h0, w1) * ww;
                             let c01 = at(d0, h1, w0) * (1.0 - ww) + at(d0, h1, w1) * ww;
@@ -1475,10 +1473,357 @@ impl Map2 for ConvTranspose3D<'_> {
 
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
 
+/// f32 specialization for the non-overlapping 2x2/stride-2 transposed
+/// convolutions used by SAM2's mask upscaler. Each kernel offset writes a
+/// distinct checkerboard of the output, so it is a dense `(H*W,Cin) ×
+/// (Cin,Cout)` GEMM followed by a strided scatter rather than an accumulation
+/// over overlapping pixels.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv_transpose2d_stride2_kernel2_f32(
+    p: &crate::conv::ParamsConvTranspose2D,
+    inp: &[f32],
+    inp_l: &Layout,
+    k: &[f32],
+    k_l: &Layout,
+    bias: Option<&[f32]>,
+    residual: Option<&[f32]>,
+) -> Result<Vec<f32>> {
+    use gemm::{gemm, Parallelism};
+    let profile_start = std::env::var_os("CANDLE_CONVTRANSPOSE_PROFILE")
+        .is_some_and(|value| value == "1")
+        .then(std::time::Instant::now);
+
+    let inp = &inp[inp_l.start_offset()..];
+    let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+    let k = &k[k_l.start_offset()..];
+    let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+    let out_h = p.out_h();
+    let out_w = p.out_w();
+    let pixels = p.i_h * p.i_w;
+
+    // The second SAM2 upscaler receives a contiguous NCHW result from the
+    // preceding normalization. GEMM can consume its `(pixel, channel)` view
+    // directly with a wide column stride, avoiding a 4 MiB pixel-major
+    // repack. Preserve the conversion for views such as the first upscaler's
+    // transformer output.
+    let nchw_contiguous = std::env::var_os("CANDLE_CONVTRANSPOSE_NCHW_DIRECT")
+        .is_none_or(|value| value != "0")
+        && inp_s3 == 1
+        && inp_s2 == p.i_w
+        && inp_s1 == pixels
+        && inp_s0 == p.c_in * pixels;
+    // A contiguous Bx(HW)xC transformer result viewed as BxCxHxW has this
+    // pixel-major stride pattern. GEMM already consumes exactly that storage
+    // order, so do not allocate and fill an identical staging buffer.
+    let pixel_major_view =
+        inp_s1 == 1 && inp_s3 == p.c_in && inp_s2 == p.i_w * p.c_in && inp_s0 == pixels * p.c_in;
+    let mut inp_cont = Vec::new();
+    if !nchw_contiguous && !pixel_major_view {
+        inp_cont.resize(p.b_size * pixels * p.c_in, 0f32);
+        for batch in 0..p.b_size {
+            for y in 0..p.i_h {
+                for x in 0..p.i_w {
+                    for channel in 0..p.c_in {
+                        inp_cont[(batch * pixels + y * p.i_w + x) * p.c_in + channel] =
+                            inp[batch * inp_s0 + channel * inp_s1 + y * inp_s2 + x * inp_s3];
+                    }
+                }
+            }
+        }
+    }
+    let input_ms = profile_start.map(|start| start.elapsed().as_secs_f64() * 1000.);
+
+    let mut dst = vec![0f32; p.b_size * p.c_out * out_h * out_w];
+    let parallelism = if crate::utils::get_num_threads() > 1 {
+        Parallelism::Rayon(crate::utils::get_num_threads())
+    } else {
+        Parallelism::None
+    };
+    // Pack all four checkerboard offsets into one wider GEMM. The arithmetic
+    // is unchanged, but this lets the GEMM implementation use a useful output
+    // width (4*Cout) and avoids four independent Rayon/GEMM dispatches.
+    let output_columns = 4 * p.c_out;
+    let mut weights = vec![0f32; p.c_in * output_columns];
+    for input_channel in 0..p.c_in {
+        for kernel_y in 0..2 {
+            for kernel_x in 0..2 {
+                let offset = (kernel_y * 2 + kernel_x) * p.c_out;
+                for output_channel in 0..p.c_out {
+                    weights[input_channel * output_columns + offset + output_channel] = k
+                        [input_channel * k_s0
+                            + output_channel * k_s1
+                            + kernel_y * k_s2
+                            + kernel_x * k_s3];
+                }
+            }
+        }
+    }
+    let weights_ms = profile_start
+        .map(|start| start.elapsed().as_secs_f64() * 1000. - input_ms.unwrap_or_default());
+    let parallel_batches = p.b_size >= 32
+        && std::env::var_os("CANDLE_CONVTRANSPOSE_PAR_BATCH").is_none_or(|value| value != "0");
+    if parallel_batches {
+        let batch_output_elements = p.c_out * out_h * out_w;
+        let residual_batch_stride = residual.map_or(0, |residual| {
+            if residual.len() == batch_output_elements {
+                0
+            } else {
+                batch_output_elements
+            }
+        });
+        dst.par_chunks_mut(batch_output_elements)
+            .enumerate()
+            .for_each_init(
+                || vec![0f32; pixels * output_columns],
+                |tile, (batch, batch_dst)| {
+                    let (input, input_row_stride, input_column_stride) = if nchw_contiguous {
+                        (
+                            unsafe { inp.as_ptr().add(batch * inp_s0) },
+                            pixels as isize,
+                            1isize,
+                        )
+                    } else if pixel_major_view {
+                        (
+                            unsafe { inp.as_ptr().add(batch * inp_s0) },
+                            1isize,
+                            p.c_in as isize,
+                        )
+                    } else {
+                        (
+                            inp_cont[batch * pixels * p.c_in..].as_ptr(),
+                            1isize,
+                            p.c_in as isize,
+                        )
+                    };
+                    unsafe {
+                        // SAFETY: each Rayon worker owns `tile`; each batch
+                        // task owns a disjoint destination slice. Inputs and
+                        // packed weights remain shared read-only.
+                        gemm(
+                            pixels,
+                            output_columns,
+                            p.c_in,
+                            tile.as_mut_ptr(),
+                            1,
+                            output_columns as isize,
+                            false,
+                            input,
+                            input_row_stride,
+                            input_column_stride,
+                            weights.as_ptr(),
+                            1,
+                            output_columns as isize,
+                            0.0f32,
+                            1.0f32,
+                            false,
+                            false,
+                            false,
+                            Parallelism::None,
+                        );
+                    }
+                    let batch_residual = residual.map(|residual| {
+                        &residual[batch * residual_batch_stride
+                            ..batch * residual_batch_stride + batch_output_elements]
+                    });
+                    for (output_channel, channel_dst) in
+                        batch_dst.chunks_mut(out_h * out_w).enumerate()
+                    {
+                        let channel_bias = bias.map(|bias| bias[output_channel]);
+                        let channel_residual = batch_residual.map(|residual| {
+                            &residual[output_channel * out_h * out_w
+                                ..(output_channel + 1) * out_h * out_w]
+                        });
+                        for y in 0..p.i_h {
+                            for x in 0..p.i_w {
+                                let source = (y * p.i_w + x) * output_columns;
+                                for kernel_y in 0..2 {
+                                    for kernel_x in 0..2 {
+                                        let offset = (kernel_y * 2 + kernel_x) * p.c_out;
+                                        let out_y = y * 2 + kernel_y;
+                                        let out_x = x * 2 + kernel_x;
+                                        let value = tile[source + offset + output_channel];
+                                        let value = channel_bias.map_or(value, |bias| value + bias);
+                                        channel_dst[out_y * out_w + out_x] = channel_residual
+                                            .map_or(value, |residual| {
+                                                value + residual[out_y * out_w + out_x]
+                                            });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            );
+        if let Some(start) = profile_start {
+            eprintln!(
+                "{{\"operation\":\"conv_transpose2d_stride2_kernel2_f32_parallel_batches\",\"input_hw\":[{},{}],\"channels\":[{},{}],\"input_ms\":{:.6},\"weights_ms\":{:.6},\"total_ms\":{:.6}}}",
+                p.i_h,
+                p.i_w,
+                p.c_in,
+                p.c_out,
+                input_ms.unwrap_or_default(),
+                weights_ms.unwrap_or_default(),
+                start.elapsed().as_secs_f64() * 1000.,
+            );
+        }
+        return Ok(dst);
+    }
+    let mut gemm_ms = 0.0;
+    let mut scatter_ms = 0.0;
+    for batch in 0..p.b_size {
+        let gemm_start = profile_start.map(|_| std::time::Instant::now());
+        let mut tile = vec![0f32; pixels * output_columns];
+        let (input, input_row_stride, input_column_stride) = if nchw_contiguous {
+            (
+                unsafe { inp.as_ptr().add(batch * inp_s0) },
+                pixels as isize,
+                1isize,
+            )
+        } else if pixel_major_view {
+            (
+                unsafe { inp.as_ptr().add(batch * inp_s0) },
+                1isize,
+                p.c_in as isize,
+            )
+        } else {
+            (
+                inp_cont[batch * pixels * p.c_in..].as_ptr(),
+                1isize,
+                p.c_in as isize,
+            )
+        };
+        unsafe {
+            // SAFETY: input, packed weights, and destination tile are
+            // contiguous matrices with the exact extents supplied.
+            gemm(
+                pixels,
+                output_columns,
+                p.c_in,
+                tile.as_mut_ptr(),
+                1,
+                output_columns as isize,
+                false,
+                input,
+                input_row_stride,
+                input_column_stride,
+                weights.as_ptr(),
+                1,
+                output_columns as isize,
+                0.0f32,
+                1.0f32,
+                false,
+                false,
+                false,
+                parallelism,
+            );
+        }
+        if let Some(start) = gemm_start {
+            gemm_ms += start.elapsed().as_secs_f64() * 1000.;
+        }
+        let scatter_start = profile_start.map(|_| std::time::Instant::now());
+        // Output channels are disjoint NCHW planes. Scatter each plane in
+        // parallel after GEMM rather than serially walking interleaved tile
+        // columns. This adds no buffer or copy: each task owns one complete
+        // destination plane and reads the shared, immutable GEMM tile.
+        let batch_dst =
+            &mut dst[batch * p.c_out * out_h * out_w..(batch + 1) * p.c_out * out_h * out_w];
+        let batch_output_elements = p.c_out * out_h * out_w;
+        let residual_batch_stride = residual.map_or(0, |residual| {
+            if residual.len() == batch_output_elements {
+                0
+            } else {
+                batch_output_elements
+            }
+        });
+        let batch_residual = residual.map(|residual| {
+            &residual[batch * residual_batch_stride
+                ..batch * residual_batch_stride + batch_output_elements]
+        });
+        let scatter_channel = |output_channel: usize, channel_dst: &mut [f32]| {
+            let channel_bias = bias.map(|bias| bias[output_channel]);
+            let channel_residual = batch_residual.map(|residual| {
+                &residual[output_channel * out_h * out_w..(output_channel + 1) * out_h * out_w]
+            });
+            for y in 0..p.i_h {
+                for x in 0..p.i_w {
+                    let source = (y * p.i_w + x) * output_columns;
+                    for kernel_y in 0..2 {
+                        for kernel_x in 0..2 {
+                            let offset = (kernel_y * 2 + kernel_x) * p.c_out;
+                            let out_y = y * 2 + kernel_y;
+                            let out_x = x * 2 + kernel_x;
+                            let value = tile[source + offset + output_channel];
+                            let value = match channel_bias {
+                                Some(bias) => value + bias,
+                                None => value,
+                            };
+                            channel_dst[out_y * out_w + out_x] = match channel_residual {
+                                Some(residual) => value + residual[out_y * out_w + out_x],
+                                None => value,
+                            };
+                        }
+                    }
+                }
+            }
+        };
+        if std::env::var_os("CANDLE_CONVTRANSPOSE_PAR_SCATTER").is_none_or(|value| value != "0") {
+            batch_dst
+                .par_chunks_mut(out_h * out_w)
+                .enumerate()
+                .for_each(|(output_channel, channel_dst)| {
+                    scatter_channel(output_channel, channel_dst)
+                });
+        } else {
+            for (output_channel, channel_dst) in batch_dst.chunks_mut(out_h * out_w).enumerate() {
+                scatter_channel(output_channel, channel_dst);
+            }
+        }
+        if let Some(start) = scatter_start {
+            scatter_ms += start.elapsed().as_secs_f64() * 1000.;
+        }
+    }
+    if let Some(start) = profile_start {
+        eprintln!(
+            "{{\"operation\":\"conv_transpose2d_stride2_kernel2_f32\",\"input_hw\":[{},{}],\"channels\":[{},{}],\"input_ms\":{:.6},\"weights_ms\":{:.6},\"gemm_ms\":{gemm_ms:.6},\"scatter_ms\":{scatter_ms:.6},\"total_ms\":{:.6}}}",
+            p.i_h,
+            p.i_w,
+            p.c_in,
+            p.c_out,
+            input_ms.unwrap_or_default(),
+            weights_ms.unwrap_or_default(),
+            start.elapsed().as_secs_f64() * 1000.,
+        );
+    }
+    Ok(dst)
+}
+
 impl Map2 for ConvTranspose2D<'_> {
     const OP: &'static str = "conv_transpose2d";
     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
         let p = self.0;
+        let use_stride2_kernel2 =
+            std::env::var_os("CANDLE_CONVTRANSPOSE_GEMM").is_none_or(|value| value != "0");
+        if use_stride2_kernel2
+            && T::DTYPE == DType::F32
+            && p.k_h == 2
+            && p.k_w == 2
+            && p.stride == 2
+            && p.padding == 0
+            && p.output_padding == 0
+            && p.dilation == 1
+        {
+            // SAFETY: the dtype guard proves T is f32. Vec<f32> and Vec<T>
+            // have identical allocation layout under that guard.
+            let inp = unsafe { std::slice::from_raw_parts(inp.as_ptr() as *const f32, inp.len()) };
+            let k = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const f32, k.len()) };
+            let mut output =
+                conv_transpose2d_stride2_kernel2_f32(p, inp, inp_l, k, k_l, None, None)?;
+            let ptr = output.as_mut_ptr();
+            let len = output.len();
+            let capacity = output.capacity();
+            std::mem::forget(output);
+            return Ok(unsafe { Vec::from_raw_parts(ptr as *mut T, len, capacity) });
+        }
         let inp = &inp[inp_l.start_offset()..];
         let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
         let k = &k[k_l.start_offset()..];
@@ -1727,7 +2072,22 @@ impl Map2 for MatMul {
         };
 
         let mut dst = vec![T::zero(); b * m * n];
-        match T::DTYPE {
+        // A whole-process MKL worker count oversubscribes the many small
+        // SAM2 GEMMs. Permit a narrowly explicit experiment for only large
+        // independent GEMMs, restoring the caller's setting afterwards.
+        let large_gemm_threads = std::env::var("CANDLE_MKL_LARGE_GEMM_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|&threads| {
+                threads > 1
+                    && b.saturating_mul(m).saturating_mul(n).saturating_mul(k) >= 250_000_000
+            });
+        let previous_threads = large_gemm_threads.map(|threads| {
+            // SAFETY: this only changes MKL's thread-local configuration for
+            // the current synchronous matmul call.
+            unsafe { crate::mkl::set_num_threads_local(threads) }
+        });
+        let result = match T::DTYPE {
             DType::F16 => {
                 crate::bail!("the accelerate backend does not support f16 matmul")
             }
@@ -1774,7 +2134,12 @@ impl Map2 for MatMul {
                 }
             }
             dtype => Err(Error::UnsupportedDTypeForOp(dtype, "matmul").bt())?,
+        };
+        if let Some(previous_threads) = previous_threads {
+            // SAFETY: restore the exact thread-local value returned above.
+            unsafe { crate::mkl::set_num_threads_local(previous_threads) };
         }
+        result;
         Ok(dst)
     }
 

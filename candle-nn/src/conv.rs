@@ -1,6 +1,7 @@
 //! Convolution Layers.
 use crate::BatchNorm;
-use candle::{conv::CudnnFwdAlgo, Result, Tensor};
+use candle::{conv::CudnnFwdAlgo, DType, Result, Storage, Tensor};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv1dConfig {
@@ -233,6 +234,163 @@ impl Conv2d {
             candle::bail!("batch norm does not have weight_and_bias")
         }
     }
+
+    /// Fuses a strict contiguous CPU-f32 1x1 convolution's bias into the
+    /// convolution destination. Other layouts and configurations use the
+    /// normal module forward unchanged.
+    pub fn forward_fused_bias_cpu(&self, x: &Tensor) -> Result<Tensor> {
+        if std::env::var_os("CANDLE_CPU_CONV1X1_FUSED").is_none_or(|value| value != "0") {
+            if let Some(bias) = &self.bias {
+                if let Some(output) = conv2d_1x1_f32_bias(x, &self.weight, bias, self.config)? {
+                    return Ok(output);
+                }
+            }
+        }
+        crate::Module::forward(self, x)
+    }
+}
+
+fn conv2d_1x1_f32_bias(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    config: Conv2dConfig,
+) -> Result<Option<Tensor>> {
+    use gemm::{gemm, Parallelism};
+    if !x.device().is_cpu()
+        || x.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || bias.dtype() != DType::F32
+        || config.padding != 0
+        || config.stride != 1
+        || config.dilation != 1
+        || config.groups != 1
+        || weight.dims4()?.2 != 1
+        || weight.dims4()?.3 != 1
+    {
+        return Ok(None);
+    }
+    let (batch, channels, height, width) = x.dims4()?;
+    let pixels = height * width;
+    let (out_channels, weight_channels, _, _) = weight.dims4()?;
+    if channels != weight_channels
+        || bias.dims1()? != out_channels
+        || batch == 0
+        || pixels == 0
+        || out_channels == 0
+    {
+        return Ok(None);
+    }
+    // Hiera hands FPN a logical NCHW view of its channels-last activations.
+    // Its spatial pixels are still regularly strided, so GEMM can consume the
+    // `(channel, pixel)` matrix directly instead of materializing a 1x1-conv
+    // input transpose. Keep the fast path narrow to layouts whose flattened
+    // spatial dimension has one constant stride.
+    let x_layout = x.layout();
+    let x_stride = x_layout.stride();
+    if x_stride.len() != 4 || x_stride[2] != width * x_stride[3] {
+        return Ok(None);
+    }
+    let nchw_contiguous = x_stride[3] == 1
+        && x_stride[2] == width
+        && x_stride[1] == pixels
+        && x_stride[0] == channels * pixels;
+    if !nchw_contiguous
+        && std::env::var_os("CANDLE_CPU_CONV1X1_STRIDED").is_some_and(|value| value == "0")
+    {
+        return Ok(None);
+    }
+    let x_start = x_layout.start_offset();
+    let Some((w_start, w_end)) = weight.layout().contiguous_offsets() else {
+        return Ok(None);
+    };
+    let Some((b_start, b_end)) = bias.layout().contiguous_offsets() else {
+        return Ok(None);
+    };
+    let (x_storage, _) = x.storage_and_layout();
+    let (weight_storage, _) = weight.storage_and_layout();
+    let (bias_storage, _) = bias.storage_and_layout();
+    let (Storage::Cpu(x_storage), Storage::Cpu(weight_storage), Storage::Cpu(bias_storage)) =
+        (&*x_storage, &*weight_storage, &*bias_storage)
+    else {
+        return Ok(None);
+    };
+    let input = &x_storage.as_slice::<f32>()?[x_start..];
+    let weights = &weight_storage.as_slice::<f32>()?[w_start..w_end];
+    let biases = &bias_storage.as_slice::<f32>()?[b_start..b_end];
+    let input_last = (batch - 1) * x_stride[0]
+        + (channels - 1) * x_stride[1]
+        + (height - 1) * x_stride[2]
+        + (width - 1) * x_stride[3];
+    if input_last >= input.len()
+        || weights.len() != out_channels * channels
+        || biases.len() != out_channels
+    {
+        return Ok(None);
+    }
+    let output_len = batch * out_channels * pixels;
+    let mut output;
+    if std::env::var_os("CANDLE_CPU_CONV1X1_SINGLE_WRITE_SEED").is_none_or(|value| value != "0") {
+        output = Vec::with_capacity(output_len);
+        output.spare_capacity_mut()[..output_len]
+            .par_chunks_mut(pixels)
+            .enumerate()
+            .for_each(|(plane_index, plane)| {
+                let bias = biases[plane_index % out_channels];
+                for output in plane {
+                    output.write(bias);
+                }
+            });
+        // SAFETY: each disjoint channel plane above writes all its elements
+        // before the vector length is increased.
+        unsafe { output.set_len(output_len) };
+    } else {
+        output = vec![0f32; output_len];
+        output
+            .par_chunks_mut(out_channels * pixels)
+            .for_each(|batch_output| {
+                for (channel, bias) in biases.iter().enumerate() {
+                    batch_output[channel * pixels..(channel + 1) * pixels].fill(*bias);
+                }
+            });
+    }
+    let parallelism = if rayon::current_num_threads() > 1 {
+        Parallelism::Rayon(rayon::current_num_threads())
+    } else {
+        Parallelism::None
+    };
+    for batch_index in 0..batch {
+        let output = &mut output
+            [batch_index * out_channels * pixels..(batch_index + 1) * out_channels * pixels];
+        unsafe {
+            gemm(
+                out_channels,
+                pixels,
+                channels,
+                output.as_mut_ptr(),
+                1,
+                pixels as isize,
+                true,
+                weights.as_ptr(),
+                1,
+                channels as isize,
+                input.as_ptr().add(batch_index * x_stride[0]),
+                x_stride[3] as isize,
+                x_stride[1] as isize,
+                1f32,
+                1f32,
+                false,
+                false,
+                false,
+                parallelism,
+            );
+        }
+    }
+    Ok(Some(Tensor::from_vec(
+        output,
+        (batch, out_channels, height, width),
+        x.device(),
+    )?))
 }
 
 impl crate::Module for Conv2d {
@@ -352,6 +510,49 @@ impl ConvTranspose2d {
 
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
+    }
+
+    /// Inference-only CPU f32 bias fusion for non-overlapping 2x2/stride-2
+    /// transposed convolutions. Other layouts and devices use `forward`.
+    pub fn forward_fused_bias_cpu(&self, x: &Tensor) -> Result<Tensor> {
+        if std::env::var_os("CANDLE_CONVTRANSPOSE_FUSED_BIAS").is_none_or(|value| value != "0") {
+            if let Some(bias) = &self.bias {
+                if let Some(output) = x.conv_transpose2d_bias_cpu(
+                    &self.weight,
+                    bias,
+                    self.config.padding,
+                    self.config.output_padding,
+                    self.config.stride,
+                    self.config.dilation,
+                )? {
+                    return Ok(output);
+                }
+            }
+        }
+        crate::Module::forward(self, x)
+    }
+
+    /// Inference-only CPU f32 fusion of transposed convolution, bias and an
+    /// equal-shaped residual. Falls back to the composed operations outside
+    /// the non-overlapping 2x2/stride-2 specialization.
+    pub fn forward_add_residual_cpu(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        if std::env::var_os("CANDLE_CONVTRANSPOSE_FUSED_RESIDUAL").is_none_or(|value| value != "0")
+        {
+            if let Some(bias) = &self.bias {
+                if let Some(output) = x.conv_transpose2d_bias_residual_cpu(
+                    &self.weight,
+                    bias,
+                    residual,
+                    self.config.padding,
+                    self.config.output_padding,
+                    self.config.stride,
+                    self.config.dilation,
+                )? {
+                    return Ok(output);
+                }
+            }
+        }
+        self.forward_fused_bias_cpu(x)?.broadcast_add(residual)
     }
 }
 
@@ -595,7 +796,10 @@ pub fn conv_transpose2d_no_bias(
 
 #[cfg(test)]
 mod tests {
-    use super::{conv3d_no_bias, Conv3d, Conv3dConfig};
+    use super::{
+        conv3d_no_bias, Conv2d, Conv2dConfig, Conv3d, Conv3dConfig, ConvTranspose2d,
+        ConvTranspose2dConfig,
+    };
     use candle::{DType, Device, Module, Result, Tensor};
 
     #[test]
@@ -634,6 +838,135 @@ mod tests {
         assert!(layer.bias().is_none());
         assert_eq!(layer.config(), &cfg);
 
+        Ok(())
+    }
+
+    #[test]
+    fn fused_cpu_1x1_bias_matches_composed_conv() -> Result<()> {
+        let dev = &Device::Cpu;
+        let input = Tensor::new((0..24).map(|v| v as f32 * 0.1).collect::<Vec<_>>(), dev)?
+            .reshape((1, 3, 2, 4))?;
+        let weight =
+            Tensor::new(&[0.1f32, -0.2, 0.3, 0.4, 0.5, -0.6], dev)?.reshape((2, 3, 1, 1))?;
+        let bias = Tensor::new(&[0.7f32, -0.8], dev)?;
+        let layer = Conv2d::new(weight, Some(bias), Conv2dConfig::default());
+        let expected = layer.forward(&input)?;
+        let actual = layer.forward_fused_bias_cpu(&input)?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_cpu_1x1_bias_matches_composed_conv_for_strided_nchw() -> Result<()> {
+        let dev = &Device::Cpu;
+        // Hiera/FPN exposes this logical NCHW shape from channels-last
+        // storage. The test keeps the physical NHWC layout and permutes it
+        // into the view consumed by the strided GEMM fast path.
+        let input = Tensor::new((0..24).map(|v| v as f32 * 0.1).collect::<Vec<_>>(), dev)?
+            .reshape((1, 2, 4, 3))?
+            .permute((0, 3, 1, 2))?;
+        assert!(!input.is_contiguous());
+        let weight =
+            Tensor::new(&[0.1f32, -0.2, 0.3, 0.4, 0.5, -0.6], dev)?.reshape((2, 3, 1, 1))?;
+        let bias = Tensor::new(&[0.7f32, -0.8], dev)?;
+        let layer = Conv2d::new(weight, Some(bias), Conv2dConfig::default());
+        let expected = layer.forward(&input)?;
+        let actual = layer.forward_fused_bias_cpu(&input)?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_cpu_transpose2d_bias_matches_composed_conv_for_strided_nchw() -> Result<()> {
+        let dev = &Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..36).map(|index| index as f32 * 0.07 - 0.9).collect(),
+            (2, 2, 3, 3),
+            dev,
+        )?
+        .permute((0, 3, 1, 2))?;
+        assert!(!input.is_contiguous());
+        let weight = Tensor::from_vec(
+            (0..48)
+                .map(|index| (index % 11) as f32 * 0.09 - 0.4)
+                .collect(),
+            (3, 4, 2, 2),
+            dev,
+        )?;
+        let bias = Tensor::new(&[0.7f32, -0.8, 0.25, -0.125], dev)?;
+        let layer = ConvTranspose2d::new(
+            weight.clone(),
+            Some(bias.clone()),
+            ConvTranspose2dConfig {
+                stride: 2,
+                ..Default::default()
+            },
+        );
+        let expected = layer.forward(&input)?.flatten_all()?.to_vec1::<f32>()?;
+        let actual = input
+            .conv_transpose2d_bias_cpu(&weight, &bias, 0, 0, 2, 1)?
+            .expect("eligible CPU f32 transposed convolution")
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_cpu_transpose2d_residual_matches_composed_conv() -> Result<()> {
+        let dev = &Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..36).map(|index| index as f32 * 0.07 - 0.9).collect(),
+            (2, 2, 3, 3),
+            dev,
+        )?
+        .permute((0, 3, 1, 2))?;
+        let weight = Tensor::from_vec(
+            (0..48)
+                .map(|index| (index % 11) as f32 * 0.09 - 0.4)
+                .collect(),
+            (3, 4, 2, 2),
+            dev,
+        )?;
+        let bias = Tensor::new(&[0.7f32, -0.8, 0.25, -0.125], dev)?;
+        let residual = Tensor::from_vec(
+            (0..96).map(|index| index as f32 * 0.003 - 0.2).collect(),
+            (1, 4, 4, 6),
+            dev,
+        )?;
+        let layer = ConvTranspose2d::new(
+            weight.clone(),
+            Some(bias.clone()),
+            ConvTranspose2dConfig {
+                stride: 2,
+                ..Default::default()
+            },
+        );
+        let expected = layer
+            .forward(&input)?
+            .broadcast_add(&residual)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = input
+            .conv_transpose2d_bias_residual_cpu(&weight, &bias, &residual, 0, 0, 2, 1)?
+            .expect("eligible CPU f32 transposed convolution")
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(expected.len(), actual.len());
+        for (expected, actual) in expected.iter().zip(actual) {
+            assert!((expected - actual).abs() <= 1e-6);
+        }
         Ok(())
     }
 }

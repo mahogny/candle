@@ -1,5 +1,8 @@
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::attention::{flash_attn, AttnMask};
+use candle_nn::attention::{
+    flash_attn, flash_attn_nhsd_f32, flash_attn_nhsd_f32_batched,
+    flash_attn_nhsd_f32_decoder_blocked, AttnMask,
+};
 
 /// Reference SDPA: softmax(Q @ K^T * scale) @ V
 fn reference_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
@@ -194,6 +197,194 @@ fn standard_no_mask_b1() -> Result<()> {
     )?;
 
     assert_close(&out, &expected, 1e-5, "standard_no_mask_b1")
+}
+
+#[test]
+fn standard_no_mask_nhsd_is_contiguous() -> Result<()> {
+    let (h, d, s) = (4, 16, 8);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+
+    let q = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+
+    assert_eq!(out.dims(), &[1, s, h, d]);
+    assert!(out.is_contiguous());
+    assert_close(&out, &expected, 1e-5, "standard_no_mask_nhsd")
+}
+
+#[test]
+fn standard_no_mask_nhsd_batched_matches_reference() -> Result<()> {
+    let (b, h, d, s) = (3, 2, 16, 8);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32_batched(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+
+    assert_eq!(out.dims(), &[b, s, h, d]);
+    assert!(out.is_contiguous());
+    assert_close(&out, &expected, 1e-5, "standard_no_mask_nhsd_batched")
+}
+
+#[test]
+fn standard_no_mask_nhsd_short_gemm_matches_reference() -> Result<()> {
+    // S=64 and B>1 exercise the batched Hiera window GEMMs, including the
+    // interleaved NHSD destination strides and contiguous-per-head inputs.
+    let (b, h, d, s) = (3, 2, 96, 64);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32_batched(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert_close(&out, &expected, 2e-4, "standard_no_mask_nhsd_short_gemm")
+}
+
+#[test]
+fn standard_no_mask_nhsd_asymmetric_gemm_matches_reference() -> Result<()> {
+    // Decoder token-to-image attention uses a handful of queries and many
+    // image keys; the K/V sequence stride is interleaved across heads.
+    let (h, d, q_len, kv_len) = (8, 16, 5, 512);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (1, h, q_len, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h, kv_len, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h, kv_len, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert_close(
+        &out,
+        &expected,
+        2e-4,
+        "standard_no_mask_nhsd_asymmetric_gemm",
+    )
+}
+
+#[test]
+fn standard_no_mask_nhsd_decoder_blocked_matches_reference() -> Result<()> {
+    // Exercise the explicit short-query/long-key blocked route without a
+    // process-global environment toggle. This is the shape used by SAM2's
+    // batch-one token-to-image decoder attention.
+    let (h, d, q_len, kv_len) = (8, 16, 8, 512);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (1, h, q_len, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h, kv_len, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h, kv_len, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32_decoder_blocked(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert!(out.is_contiguous());
+    assert_close(
+        &out,
+        &expected,
+        2e-4,
+        "standard_no_mask_nhsd_decoder_blocked",
+    )
+}
+
+#[test]
+fn standard_no_mask_nhsd_asymmetric_gemm_batched_matches_reference() -> Result<()> {
+    // Prompt batches use the same short-query/long-key decoder shape as the
+    // batch-one path, with each batch entry owning independent Q/K/V storage.
+    let (b, h, d, q_len, kv_len) = (4, 8, 16, 8, 512);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (b, h, q_len, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (b, h, kv_len, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (b, h, kv_len, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32_batched(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert_close(
+        &out,
+        &expected,
+        2e-4,
+        "standard_no_mask_nhsd_asymmetric_gemm_batched",
+    )
+}
+
+#[test]
+fn standard_no_mask_nhsd_blocked_matches_reference() -> Result<()> {
+    // S=768 selects the blocked f32 NHSD prefill path. The transposed inputs
+    // reproduce SAM2's last-dimension-contiguous, leading-strided Q/K/V views.
+    let (h, d, s) = (2, 16, 768);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (1, h, s, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert!(out.is_contiguous());
+    assert_close(&out, &expected, 2e-4, "standard_no_mask_nhsd_blocked")
+}
+
+#[test]
+fn standard_no_mask_nhsd_blocked_batched_matches_reference() -> Result<()> {
+    // B=2 verifies that the blocked long-sequence path honors every leading
+    // batch stride rather than reading or writing batch zero twice.
+    let (b, h, d, s) = (2, 2, 16, 768);
+    let scale = 1.0 / (d as f32).sqrt();
+    let dev = &Device::Cpu;
+    let q = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let k = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let v = Tensor::randn(0f32, 1f32, (b, h, s, d), dev)?;
+    let expected = reference_sdpa(&q, &k, &v, scale)?.permute((0, 2, 1, 3))?;
+    let out = flash_attn_nhsd_f32_batched(
+        &q.transpose(1, 2)?,
+        &k.transpose(1, 2)?,
+        &v.transpose(1, 2)?,
+        scale,
+    )?;
+    assert!(out.is_contiguous());
+    assert_close(
+        &out,
+        &expected,
+        2e-4,
+        "standard_no_mask_nhsd_blocked_batched",
+    )
 }
 
 // Standard with explicit mask

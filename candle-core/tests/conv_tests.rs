@@ -1004,6 +1004,63 @@ fn conv2d_noncontiguous_input(dev: &Device) -> Result<()> {
 }
 
 #[test]
+fn conv2d_large_vision_stem_cpu() -> Result<()> {
+    // Exercises the 7x7 RGB -> 144-channel vision-stem dispatch used by deep
+    // image encoders. Keep the spatial shape small enough for a direct scalar
+    // reference while preserving stride/padding/channel parameters.
+    let (height, width, out_channels) = (15usize, 17usize, 144usize);
+    let input_values = (0..3 * height * width)
+        .map(|index| (index as f32 * 0.013).sin())
+        .collect::<Vec<_>>();
+    let kernel_values = (0..out_channels * 3 * 7 * 7)
+        .map(|index| (index as f32 * 0.007).cos() * 0.05)
+        .collect::<Vec<_>>();
+    let input = Tensor::from_vec(input_values.clone(), (1, 3, height, width), &Device::Cpu)?;
+    let kernel = Tensor::from_vec(kernel_values.clone(), (out_channels, 3, 7, 7), &Device::Cpu)?;
+    let actual = input.conv2d(&kernel, 3, 4, 1, 1)?;
+    let (out_height, out_width) = (actual.dim(2)?, actual.dim(3)?);
+    let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+
+    for out_channel in 0..out_channels {
+        for out_y in 0..out_height {
+            for out_x in 0..out_width {
+                let mut expected = 0f32;
+                for in_channel in 0..3 {
+                    for kernel_y in 0..7 {
+                        for kernel_x in 0..7 {
+                            let input_y = out_y * 4 + kernel_y;
+                            let input_x = out_x * 4 + kernel_x;
+                            if input_y >= 3
+                                && input_y < height + 3
+                                && input_x >= 3
+                                && input_x < width + 3
+                            {
+                                let input_index =
+                                    in_channel * height * width + (input_y - 3) * width + input_x
+                                        - 3;
+                                let kernel_index = out_channel * 3 * 7 * 7
+                                    + in_channel * 7 * 7
+                                    + kernel_y * 7
+                                    + kernel_x;
+                                expected += input_values[input_index] * kernel_values[kernel_index];
+                            }
+                        }
+                    }
+                }
+                let index = out_channel * out_height * out_width + out_y * out_width + out_x;
+                let diff = (actual[index] - expected).abs();
+                assert!(
+                    diff <= 2e-5,
+                    "vision stem mismatch at channel={out_channel}, y={out_y}, x={out_x}: actual={}, expected={expected}, diff={diff}",
+                    actual[index]
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn conv3d_cpu() -> Result<()> {
     let dev = &Device::Cpu;
     let t = Tensor::new((0..27).map(|v| v as f32).collect::<Vec<_>>(), dev)?
@@ -1358,7 +1415,10 @@ fn conv_transpose3d(dev: &Device) -> Result<()> {
     let y = x.conv_transpose3d(&w, 0, 0, 1, 1)?;
     assert_eq!(y.dims(), &[1, 3, 5, 6, 7]);
     let flat = y.flatten_all()?.to_vec1::<f32>()?;
-    for (got, want) in flat.iter().zip([5.571429f32, 9.285715, 11.428571, 9.714286].iter()) {
+    for (got, want) in flat
+        .iter()
+        .zip([5.571429f32, 9.285715, 11.428571, 9.714286].iter())
+    {
         assert!((got - want).abs() < 1e-4, "got {got} want {want}");
     }
     assert!((flat.iter().sum::<f32>() - 80.000031).abs() < 1e-2);
@@ -1386,9 +1446,123 @@ fn conv_transpose3d(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Covers the CPU f32 2x2/stride-2 non-overlapping specialization with a
+/// direct reference loop. The output-position mapping is the easy place to
+/// accidentally transpose a packed GEMM operand.
+fn conv_transpose2d_stride2_kernel2(dev: &Device) -> Result<()> {
+    // Batch 32 also exercises the independent-batch CPU scheduler used by
+    // SAM2 automatic-mask decoding while keeping the reference tiny.
+    let (batch, c_in, c_out, height, width) = (32usize, 2usize, 3usize, 3usize, 2usize);
+    let input_values: Vec<f32> = (0..batch * c_in * height * width)
+        .map(|index| index as f32 * 0.125 - 0.75)
+        .collect();
+    let weight_values: Vec<f32> = (0..c_in * c_out * 2 * 2)
+        .map(|index| (index as f32 % 9. - 4.) * 0.2)
+        .collect();
+    let input = Tensor::from_vec(input_values.clone(), (batch, c_in, height, width), dev)?;
+    let weight = Tensor::from_vec(weight_values.clone(), (c_in, c_out, 2, 2), dev)?;
+    let output = input.conv_transpose2d(&weight, 0, 0, 2, 1)?;
+    assert_eq!(output.dims(), &[batch, c_out, height * 2, width * 2]);
+
+    let mut expected = vec![0f32; batch * c_out * height * 2 * width * 2];
+    for b in 0..batch {
+        for in_channel in 0..c_in {
+            for y in 0..height {
+                for x in 0..width {
+                    let input_value =
+                        input_values[((b * c_in + in_channel) * height + y) * width + x];
+                    for out_channel in 0..c_out {
+                        for ky in 0..2 {
+                            for kx in 0..2 {
+                                expected[((b * c_out + out_channel) * height * 2 + y * 2 + ky)
+                                    * width
+                                    * 2
+                                    + x * 2
+                                    + kx] += input_value
+                                    * weight_values
+                                        [((in_channel * c_out + out_channel) * 2 + ky) * 2 + kx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let actual = output.flatten_all()?.to_vec1::<f32>()?;
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "actual {actual} expected {expected}"
+        );
+    }
+    Ok(())
+}
+
+test_device!(
+    conv_transpose2d_stride2_kernel2,
+    conv_transpose2d_stride2_kernel2_cpu,
+    conv_transpose2d_stride2_kernel2_gpu,
+    conv_transpose2d_stride2_kernel2_metal
+);
+
 test_device!(
     conv_transpose3d,
     conv_transpose3d_cpu,
     conv_transpose3d_gpu,
     conv_transpose3d_metal
 );
+
+#[test]
+fn conv2d_native_depthwise_cpu() -> Result<()> {
+    let (batch, channels, height, width, kernel) = (2usize, 3usize, 5usize, 4usize, 3usize);
+    let input_values: Vec<f32> = (0..batch * channels * height * width)
+        .map(|index| (index as f32 % 17. - 8.) * 0.125)
+        .collect();
+    let weight_values: Vec<f32> = (0..channels * kernel * kernel)
+        .map(|index| (index as f32 % 11. - 5.) * 0.2)
+        .collect();
+    let input = Tensor::from_vec(
+        input_values.clone(),
+        (batch, channels, height, width),
+        &Device::Cpu,
+    )?;
+    let weights = Tensor::from_vec(
+        weight_values.clone(),
+        (channels, 1, kernel, kernel),
+        &Device::Cpu,
+    )?;
+    let actual = input
+        .conv2d(&weights, 1, 1, 1, channels)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut expected = vec![0f32; batch * channels * height * width];
+    for b in 0..batch {
+        for channel in 0..channels {
+            for out_y in 0..height {
+                for out_x in 0..width {
+                    let mut sum = 0f32;
+                    for kernel_y in 0..kernel {
+                        let input_y = out_y as isize + kernel_y as isize - 1;
+                        if !(0..height as isize).contains(&input_y) {
+                            continue;
+                        }
+                        for kernel_x in 0..kernel {
+                            let input_x = out_x as isize + kernel_x as isize - 1;
+                            if !(0..width as isize).contains(&input_x) {
+                                continue;
+                            }
+                            sum += input_values[((b * channels + channel) * height
+                                + input_y as usize)
+                                * width
+                                + input_x as usize]
+                                * weight_values[(channel * kernel + kernel_y) * kernel + kernel_x];
+                        }
+                    }
+                    expected[((b * channels + channel) * height + out_y) * width + out_x] = sum;
+                }
+            }
+        }
+    }
+    assert_eq!(actual, expected);
+    Ok(())
+}

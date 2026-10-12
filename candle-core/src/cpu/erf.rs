@@ -34,6 +34,32 @@ pub fn erf_f32(x: f32) -> f32 {
     libm::erff(x)
 }
 
+#[cfg(all(
+    feature = "glibc-vector-math",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+unsafe extern "C" {
+    fn candle_glibc_expf_inplace(values: *mut f32, len: usize);
+}
+
+/// Applies glibc's AVX-512 vector expf in place when the opt-in platform ABI
+/// is enabled and supported by this CPU. Returns whether the vector path ran.
+#[cfg(all(
+    feature = "glibc-vector-math",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+pub fn exp_f32_inplace_glibc(values: &mut [f32]) -> bool {
+    if values.len() < 16 || !std::is_x86_feature_detected!("avx512f") {
+        return false;
+    }
+    // SAFETY: the runtime feature check and slice guarantee the C wrapper's
+    // AVX-512 load/store and pointer range are valid.
+    unsafe { candle_glibc_expf_inplace(values.as_mut_ptr(), values.len()) };
+    true
+}
+
 /// `erf_inv` calculates the inverse error function
 /// at `x`.
 pub fn erf_inv(x: f64) -> f64 {

@@ -195,7 +195,7 @@ impl PromptEncoder {
         let ce2 = corner_embedding.i((.., 1))?;
         let ce1 = (ce1 + self.point_embeddings[2].embeddings())?;
         let ce2 = (ce2 + self.point_embeddings[3].embeddings())?;
-        Tensor::cat(&[&ce1, &ce2], 1)
+        Tensor::cat(&[&ce1.unsqueeze(1)?, &ce2.unsqueeze(1)?], 1)
     }
 
     pub fn forward(

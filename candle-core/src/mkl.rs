@@ -4,6 +4,7 @@ use libc::{c_char, c_double, c_float, c_int};
 mod ffi {
     use super::*;
     extern "C" {
+        pub fn mkl_set_num_threads_local(nth: c_int) -> c_int;
         pub fn vsTanh(n: c_int, a: *const c_float, y: *mut c_float);
         pub fn vdTanh(n: c_int, a: *const c_double, y: *mut c_double);
         pub fn vsExp(n: c_int, a: *const c_float, y: *mut c_float);
@@ -76,6 +77,14 @@ mod ffi {
             ldc: *const c_int,
         );
     }
+}
+
+/// Sets the calling thread's MKL worker count and returns its previous value.
+/// This is used only by an explicit experimental scheduler so small GEMMs do
+/// not inherit a costly large-thread setting.
+#[inline]
+pub unsafe fn set_num_threads_local(threads: i32) -> i32 {
+    unsafe { ffi::mkl_set_num_threads_local(threads) }
 }
 
 #[allow(clippy::too_many_arguments)]

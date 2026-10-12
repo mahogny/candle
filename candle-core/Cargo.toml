@@ -51,6 +51,9 @@ cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:intel-mkl-src"]
+# Use glibc's AVX-512 vector math ABI for selected exact f32 unary kernels.
+# This is deliberately opt-in: it requires glibc 2.35+ on Linux x86-64.
+glibc-vector-math = []
 accelerate = ["dep:accelerate-src"]
 metal = [
     "dep:objc2-metal",

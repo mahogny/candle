@@ -866,7 +866,7 @@ __device__ void upsample_trilinear3d(
     dst[dst_i] = static_cast<scalar_t>(c0 * (1.0 - wd) + c1 * wd);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename acc_t>
 __device__ void upsample_bilinear2d(
     const size_t w_out,
     const size_t h_out,
@@ -900,29 +900,29 @@ __device__ void upsample_bilinear2d(
     const size_t dst_w = dst_i % w_out;
     
     // Calculate scale factors following PyTorch's area_pixel_compute_scale logic
-    double h_scale, w_scale;
+    acc_t h_scale, w_scale;
     if (align_corners) {
-        h_scale = (h_out > 1) ? static_cast<double>(h_in - 1) / (h_out - 1) : 0.0;
-        w_scale = (w_out > 1) ? static_cast<double>(w_in - 1) / (w_out - 1) : 0.0;
+        h_scale = (h_out > 1) ? static_cast<acc_t>(h_in - 1) / (h_out - 1) : acc_t(0);
+        w_scale = (w_out > 1) ? static_cast<acc_t>(w_in - 1) / (w_out - 1) : acc_t(0);
     } else {
         // PyTorch's compute_scales_value logic
-        h_scale = has_scale_h ? (1.0 / scale_h_factor) : (static_cast<double>(h_in) / h_out);
-        w_scale = has_scale_w ? (1.0 / scale_w_factor) : (static_cast<double>(w_in) / w_out);
+        h_scale = has_scale_h ? static_cast<acc_t>(1.0 / scale_h_factor) : (static_cast<acc_t>(h_in) / h_out);
+        w_scale = has_scale_w ? static_cast<acc_t>(1.0 / scale_w_factor) : (static_cast<acc_t>(w_in) / w_out);
     }
     
     // Compute source position (floating point)
-    double src_h_fp, src_w_fp;
+    acc_t src_h_fp, src_w_fp;
     if (align_corners) {
         src_h_fp = h_scale * dst_h;
         src_w_fp = w_scale * dst_w;
     } else {
-        src_h_fp = h_scale * (dst_h + 0.5) - 0.5;
-        src_w_fp = w_scale * (dst_w + 0.5) - 0.5;
+        src_h_fp = h_scale * (static_cast<acc_t>(dst_h) + acc_t(0.5)) - acc_t(0.5);
+        src_w_fp = w_scale * (static_cast<acc_t>(dst_w) + acc_t(0.5)) - acc_t(0.5);
     }
     
     // Clamp to valid range
-    src_h_fp = fmax(0.0, src_h_fp);
-    src_w_fp = fmax(0.0, src_w_fp);
+    src_h_fp = max(acc_t(0), src_h_fp);
+    src_w_fp = max(acc_t(0), src_w_fp);
     
     // Get integer indices
     size_t h0 = static_cast<size_t>(floor(src_h_fp));
@@ -931,10 +931,10 @@ __device__ void upsample_bilinear2d(
     size_t w1 = min(w0 + 1, w_in - 1);
     
     // Compute interpolation weights
-    double weight_h = src_h_fp - h0;
-    double weight_w = src_w_fp - w0;
-    weight_h = fmin(fmax(weight_h, 0.0), 1.0);
-    weight_w = fmin(fmax(weight_w, 0.0), 1.0);
+    acc_t weight_h = src_h_fp - static_cast<acc_t>(h0);
+    acc_t weight_w = src_w_fp - static_cast<acc_t>(w0);
+    weight_h = min(max(weight_h, acc_t(0)), acc_t(1));
+    weight_w = min(max(weight_w, acc_t(0)), acc_t(1));
     
     // Get base index
     const size_t base = b_idx * src_s[0] + c_idx * src_s[1];
@@ -946,15 +946,14 @@ __device__ void upsample_bilinear2d(
     const scalar_t v11 = src[base + h1 * src_s[2] + w1 * src_s[3]];
     
     // Bilinear interpolation
-    // Convert to double for computation to avoid type issues with __half and __nv_bfloat16
-    const double v00_d = static_cast<double>(v00);
-    const double v10_d = static_cast<double>(v10);
-    const double v01_d = static_cast<double>(v01);
-    const double v11_d = static_cast<double>(v11);
+    const acc_t v00_d = static_cast<acc_t>(v00);
+    const acc_t v10_d = static_cast<acc_t>(v10);
+    const acc_t v01_d = static_cast<acc_t>(v01);
+    const acc_t v11_d = static_cast<acc_t>(v11);
     
-    const double v_top = v00_d * (1.0 - weight_w) + v10_d * weight_w;
-    const double v_bottom = v01_d * (1.0 - weight_w) + v11_d * weight_w;
-    const double value = v_top * (1.0 - weight_h) + v_bottom * weight_h;
+    const acc_t v_top = v00_d * (acc_t(1) - weight_w) + v10_d * weight_w;
+    const acc_t v_bottom = v01_d * (acc_t(1) - weight_w) + v11_d * weight_w;
+    const acc_t value = v_top * (acc_t(1) - weight_h) + v_bottom * weight_h;
     
     dst[dst_i] = static_cast<scalar_t>(value);
 }
@@ -1191,7 +1190,7 @@ extern "C" __global__ void FN_NAME(  \
   upsample_trilinear3d<TYPENAME>(d_out, h_out, w_out, align_corners, has_scale_d, scale_d_factor, has_scale_h, scale_h_factor, has_scale_w, scale_w_factor, info, src, dst); \
 } \
 
-#define UPSAMPLE_BILINEAR2D_OP(TYPENAME, FN_NAME) \
+#define UPSAMPLE_BILINEAR2D_OP(TYPENAME, TYPEACC, FN_NAME) \
 extern "C" __global__ void FN_NAME(  \
     const size_t w_out, \
     const size_t h_out, \
@@ -1204,7 +1203,7 @@ extern "C" __global__ void FN_NAME(  \
     const TYPENAME *src, \
     TYPENAME *dst \
 ) {  \
-  upsample_bilinear2d<TYPENAME>(w_out, h_out, align_corners, has_scale_h, scale_h_factor, has_scale_w, scale_w_factor, info, src, dst); \
+  upsample_bilinear2d<TYPENAME, TYPEACC>(w_out, h_out, align_corners, has_scale_h, scale_h_factor, has_scale_w, scale_w_factor, info, src, dst); \
 } \
 
 #if __CUDA_ARCH__ >= 800
@@ -1217,7 +1216,7 @@ AVG_POOL2D_OP(__nv_bfloat16, float, avg_pool2d_bf16)
 MAX_POOL2D_OP(__nv_bfloat16, max_pool2d_bf16)
 MAX_POOL3D_OP(__nv_bfloat16, max_pool3d_bf16)
 UPSAMPLE_NEAREST2D_OP(__nv_bfloat16, upsample_nearest2d_bf16)
-UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, upsample_bilinear2d_bf16)
+UPSAMPLE_BILINEAR2D_OP(__nv_bfloat16, float, upsample_bilinear2d_bf16)
 UPSAMPLE_TRILINEAR3D_OP(__nv_bfloat16, upsample_trilinear3d_bf16)
 IM2COL_OP(__nv_bfloat16, im2col_bf16)
 IM2COL3D_OP(__nv_bfloat16, im2col3d_bf16)
@@ -1248,7 +1247,7 @@ AVG_POOL2D_OP(__half, float, avg_pool2d_f16)
 MAX_POOL2D_OP(__half, max_pool2d_f16)
 MAX_POOL3D_OP(__half, max_pool3d_f16)
 UPSAMPLE_NEAREST2D_OP(__half, upsample_nearest2d_f16)
-UPSAMPLE_BILINEAR2D_OP(__half, upsample_bilinear2d_f16)
+UPSAMPLE_BILINEAR2D_OP(__half, float, upsample_bilinear2d_f16)
 UPSAMPLE_TRILINEAR3D_OP(__half, upsample_trilinear3d_f16)
 IM2COL_OP(__half, im2col_f16)
 IM2COL3D_OP(__half, im2col3d_f16)
@@ -1299,13 +1298,13 @@ UPSAMPLE_NEAREST2D_OP(double, upsample_nearest2d_f64)
 UPSAMPLE_NEAREST2D_OP(uint8_t, upsample_nearest2d_u8)
 UPSAMPLE_NEAREST2D_OP(uint32_t, upsample_nearest2d_u32)
 
-UPSAMPLE_BILINEAR2D_OP(float, upsample_bilinear2d_f32)
+UPSAMPLE_BILINEAR2D_OP(float, float, upsample_bilinear2d_f32)
 UPSAMPLE_TRILINEAR3D_OP(float, upsample_trilinear3d_f32)
-UPSAMPLE_BILINEAR2D_OP(double, upsample_bilinear2d_f64)
+UPSAMPLE_BILINEAR2D_OP(double, double, upsample_bilinear2d_f64)
 UPSAMPLE_TRILINEAR3D_OP(double, upsample_trilinear3d_f64)
-UPSAMPLE_BILINEAR2D_OP(uint8_t, upsample_bilinear2d_u8)
+UPSAMPLE_BILINEAR2D_OP(uint8_t, float, upsample_bilinear2d_u8)
 UPSAMPLE_TRILINEAR3D_OP(uint8_t, upsample_trilinear3d_u8)
-UPSAMPLE_BILINEAR2D_OP(uint32_t, upsample_bilinear2d_u32)
+UPSAMPLE_BILINEAR2D_OP(uint32_t, float, upsample_bilinear2d_u32)
 UPSAMPLE_TRILINEAR3D_OP(uint32_t, upsample_trilinear3d_u32)
 
 IM2COL_OP(float, im2col_f32)

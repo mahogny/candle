@@ -134,10 +134,7 @@ fn max_pool3d(dev: &Device) -> Result<()> {
     let pooled = t.max_pool3d((2, 2, 2))?;
     assert_eq!(pooled.dims(), &[1, 2, 2, 3, 3]);
     let flat = pooled.flatten_all()?.to_vec1::<f32>()?;
-    assert_eq!(
-        &flat[..9],
-        &[18., -9., -7., 1., 3., 5., 13., 15., 17.]
-    );
+    assert_eq!(&flat[..9], &[18., -9., -7., 1., 3., 5., 13., 15., 17.]);
     assert_eq!(flat.iter().sum::<f32>(), 277.);
 
     let pooled = t.max_pool3d((2, 3, 3))?;
@@ -173,9 +170,7 @@ fn upsample_trilinear3d(dev: &Device) -> Result<()> {
     let up = t.upsample_trilinear3d_with_scale(2.0, 2.0, 2.0, false)?;
     assert_eq!(up.dims(), &[1, 2, 6, 8, 10]);
     let flat = up.flatten_all()?.to_vec1::<f32>()?;
-    let expected = [
-        -11.0f32, -10.75, -10.25, -9.75, -9.25, -8.75, -8.25, -7.75,
-    ];
+    let expected = [-11.0f32, -10.75, -10.25, -9.75, -9.25, -8.75, -8.25, -7.75];
     for (got, want) in flat.iter().zip(expected.iter()) {
         assert!((got - want).abs() < 1e-4, "got {got} want {want}");
     }

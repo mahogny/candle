@@ -5,6 +5,77 @@ use crate::Tensor;
 use float8::F8E4M3 as f8e4m3;
 use half::{bf16, f16};
 use num_traits::float::Float;
+use rayon::prelude::*;
+#[cfg(all(
+    feature = "glibc-vector-math",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+unsafe extern "C" {
+    fn candle_glibc_gelu_erf_f32x16(values: *const f32, output: *mut f32);
+}
+
+// glibc's vector ABI is used only behind its explicit platform feature.  Its
+// symbol requires glibc 2.35, which cannot be assumed by Candle's portable
+// default build.
+#[cfg(all(
+    feature = "glibc-vector-math",
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+#[target_feature(enable = "avx512f")]
+unsafe fn gelu_erf_f32x16_glibc(values: *const f32, output: *mut f32) {
+    // SAFETY: callers gate AVX-512F at runtime and pass sixteen readable and
+    // writable f32 values. The C wrapper contains the vector ABI.
+    unsafe {
+        candle_glibc_gelu_erf_f32x16(values, output);
+    }
+}
+
+/// Apply exact f32 GELU to an owned CPU buffer without allocating another
+/// tensor. The same scalar/vector kernels and task granularity as `GeluErf`
+/// are used so callers can fuse it with an operation that already owns its
+/// destination.
+pub fn gelu_erf_f32_inplace(values: &mut [f32]) {
+    const PARALLEL_THRESHOLD: usize = 16 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    #[cfg(all(
+        feature = "glibc-vector-math",
+        target_arch = "x86_64",
+        target_os = "linux"
+    ))]
+    let vector_erf = std::is_x86_feature_detected!("avx512f");
+    let apply = |values: &mut [f32]| {
+        #[cfg(all(
+            feature = "glibc-vector-math",
+            target_arch = "x86_64",
+            target_os = "linux"
+        ))]
+        if vector_erf {
+            let vector_len = values.len() / 16 * 16;
+            for index in (0..vector_len).step_by(16) {
+                // SAFETY: runtime AVX-512F detection and chunk bounds prove
+                // that the in-place vector load/store accesses are valid.
+                unsafe {
+                    let ptr = values.as_mut_ptr().add(index);
+                    gelu_erf_f32x16_glibc(ptr, ptr);
+                }
+            }
+            for value in &mut values[vector_len..] {
+                *value = GeluErf::f32(*value);
+            }
+            return;
+        }
+        for value in values {
+            *value = GeluErf::f32(*value);
+        }
+    };
+    if values.len() >= PARALLEL_THRESHOLD {
+        values.par_chunks_mut(CHUNK).for_each(apply);
+    } else {
+        apply(values);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
@@ -1042,6 +1113,57 @@ impl UnaryOpT for GeluErf {
     #[inline(always)]
     fn f32(v: f32) -> f32 {
         (crate::cpu::erf::erf_f32(v * std::f32::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
+    }
+    #[inline]
+    fn f32_vec(xs: &[f32], ys: &mut [f32]) {
+        // Exact erf is substantially more expensive than the surrounding
+        // elementwise arithmetic.  Large contiguous activations are
+        // independent, so split them into coarse tasks rather than leaving a
+        // single CPU core to call libm::erff for every element.  The threshold
+        // avoids Rayon scheduling overhead for normal small tensors.
+        const PARALLEL_THRESHOLD: usize = 16 * 1024;
+        const CHUNK: usize = 16 * 1024;
+        #[cfg(all(
+            feature = "glibc-vector-math",
+            target_arch = "x86_64",
+            target_os = "linux"
+        ))]
+        let vector_erf = std::is_x86_feature_detected!("avx512f");
+        if xs.len() >= PARALLEL_THRESHOLD {
+            xs.par_chunks(CHUNK)
+                .zip(ys.par_chunks_mut(CHUNK))
+                .for_each(|(xs, ys)| {
+                    #[cfg(all(
+                        feature = "glibc-vector-math",
+                        target_arch = "x86_64",
+                        target_os = "linux"
+                    ))]
+                    if vector_erf {
+                        let vector_len = xs.len() / 16 * 16;
+                        for index in (0..vector_len).step_by(16) {
+                            // SAFETY: runtime AVX-512F check above and the
+                            // chunk bounds prove the vector load/store valid.
+                            unsafe {
+                                gelu_erf_f32x16_glibc(
+                                    xs.as_ptr().add(index),
+                                    ys.as_mut_ptr().add(index),
+                                );
+                            }
+                        }
+                        for (&x, y) in xs[vector_len..].iter().zip(&mut ys[vector_len..]) {
+                            *y = Self::f32(x);
+                        }
+                        return;
+                    }
+                    for (&x, y) in xs.iter().zip(ys) {
+                        *y = (crate::cpu::erf::erf_f32(x * std::f32::consts::FRAC_1_SQRT_2) + 1.)
+                            * 0.5
+                            * x;
+                    }
+                });
+        } else {
+            xs.iter().zip(ys).for_each(|(&x, y)| *y = Self::f32(x));
+        }
     }
     #[inline(always)]
     fn f64(v: f64) -> f64 {

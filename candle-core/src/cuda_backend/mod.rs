@@ -18,7 +18,7 @@ pub mod cudnn;
 mod device;
 mod error;
 mod utils;
-pub use device::{CudaDevice, DeviceId};
+pub use device::{CudaDevice, CudaMemoryPoolStats, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
@@ -984,7 +984,9 @@ impl Map2 for ConvTranspose3D<'_> {
     }
 }
 
+#[cfg(not(feature = "cudnn"))]
 struct ConvTranspose2D<'a>(&'a crate::conv::ParamsConvTranspose2D);
+#[cfg(not(feature = "cudnn"))]
 impl Map2 for ConvTranspose2D<'_> {
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
         &self,
@@ -2476,6 +2478,7 @@ impl BackendStorage for CudaStorage {
         Ok(Self { slice, device })
     }
 
+    #[cfg(not(feature = "cudnn"))]
     fn conv_transpose2d(
         &self,
         l: &Layout,
@@ -2486,6 +2489,102 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         let slice =
             ConvTranspose2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice, device })
+    }
+
+    #[cfg(feature = "cudnn")]
+    fn conv_transpose2d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConvTranspose2D,
+    ) -> Result<Self> {
+        let device = self.device().clone();
+        if !kernel_l.is_contiguous() {
+            let mut kernel_c = unsafe {
+                self.device()
+                    .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+            };
+            kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+            return self.conv_transpose2d(
+                l,
+                &kernel_c,
+                &Layout::contiguous(kernel_l.shape()),
+                params,
+            );
+        }
+        let dst_el = params.c_out * params.out_w() * params.out_h() * params.b_size;
+        let slice = match (&self.slice, &kernel.slice) {
+            (S::U8(inp), S::U8(k)) => {
+                let inp = &inp.slice(l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<u8>(dst_el)? };
+                crate::cudnn::launch_conv_transpose2d::<u8, u8>(
+                    inp, l, k, &mut out, params, &device,
+                )
+                .map_err(crate::Error::wrap)?;
+                S::U8(out)
+            }
+            (S::BF16(inp), S::BF16(k)) => {
+                let inp = &inp.slice(l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<bf16>(dst_el)? };
+                crate::cudnn::launch_conv_transpose2d::<bf16, f32>(
+                    inp, l, k, &mut out, params, &device,
+                )
+                .map_err(crate::Error::wrap)?;
+                S::BF16(out)
+            }
+            (S::F16(inp), S::F16(k)) => {
+                let inp = &inp.slice(l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f16>(dst_el)? };
+                crate::cudnn::launch_conv_transpose2d::<f16, f16>(
+                    inp, l, k, &mut out, params, &device,
+                )
+                .map_err(crate::Error::wrap)?;
+                S::F16(out)
+            }
+            (S::F32(inp), S::F32(k)) => {
+                let inp = &inp.slice(l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f32>(dst_el)? };
+                crate::cudnn::launch_conv_transpose2d::<f32, f32>(
+                    inp, l, k, &mut out, params, &device,
+                )
+                .map_err(crate::Error::wrap)?;
+                S::F32(out)
+            }
+            (S::F64(inp), S::F64(k)) => {
+                let inp = &inp.slice(l.start_offset()..);
+                let k = &k.slice(kernel_l.start_offset()..);
+                let mut out = unsafe { device.alloc::<f64>(dst_el)? };
+                crate::cudnn::launch_conv_transpose2d::<f64, f64>(
+                    inp, l, k, &mut out, params, &device,
+                )
+                .map_err(crate::Error::wrap)?;
+                S::F64(out)
+            }
+            (S::U32(_), S::U32(_)) => Err(CudaError::InternalError(
+                "conv_transpose2d does not support u32",
+            ))?,
+            (S::I16(_), S::I16(_)) => Err(CudaError::InternalError(
+                "conv_transpose2d does not support i16",
+            ))?,
+            (S::I32(_), S::I32(_)) => Err(CudaError::InternalError(
+                "conv_transpose2d does not support i32",
+            ))?,
+            (S::I64(_), S::I64(_)) => Err(CudaError::InternalError(
+                "conv_transpose2d does not support i64",
+            ))?,
+            (S::F8E4M3(_), S::F8E4M3(_)) => Err(CudaError::InternalError(
+                "conv_transpose2d does not support f8e4m3",
+            ))?,
+            _ => Err(CudaError::InternalError(
+                "dtype mismatch in conv_transpose2d",
+            ))?,
+        };
         Ok(Self { slice, device })
     }
 

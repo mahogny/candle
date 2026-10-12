@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::prelude::ParallelSliceMut;
 
 use crate::{
     conv::ParamsConv2D,
@@ -31,6 +32,14 @@ impl Map2 for Conv2D<'_> {
     ) -> Result<Vec<T>> {
         let p = self.0;
 
+        // Depthwise convolution has one input and output channel per group.
+        // Execute the full tensor natively instead of entering Tensor's
+        // generic group splitter, which creates and concatenates one tensor
+        // per channel. Each Rayon task owns one complete output plane.
+        if p.groups == p.c_in && p.groups == p.c_out {
+            return conv2d_depthwise_direct(p, inp, inp_l, k, k_l);
+        }
+
         // Specialization: pick the best algorithm based on parameters.
         // 1x1 convolutions with stride=1, padding=0, dilation=1
         if p.k_h == 1 && p.k_w == 1 && p.stride == 1 && p.padding == 0 && p.dilation == 1 {
@@ -42,13 +51,153 @@ impl Map2 for Conv2D<'_> {
         }
         // TODO other cases
 
-        // No fast path, fallback to default general impl.
-        match DEFAULT_CONV2D_IMPL {
+        // No fast path, fallback to the selected general implementation.
+        // This process-level switch is deliberately attribution-only: it lets
+        // real-model benchmarks compare the existing tiled/full/direct paths
+        // without changing the portable default.
+        let force_full_kernel = std::env::var("CANDLE_CPU_CONV2D_FULL_KERNEL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|kernel| p.k_h == kernel && p.k_w == kernel);
+        // Large vision stems are numerically sensitive to the transposed
+        // tiled GEMM order: a single 7x7 patch embedding is amplified through
+        // dozens of transformer blocks. The full im2col orientation matches
+        // the established reference envelope for this shape. Smaller stems
+        // retain the faster bounded-scratch tiled route.
+        let large_vision_stem = p.c_in == 3
+            && p.c_out >= 144
+            && p.k_h == 7
+            && p.k_w == 7
+            && p.stride == 4
+            && p.padding == 3
+            && p.dilation == 1
+            && std::env::var_os("CANDLE_CPU_CONV2D_LARGE_VISION_FULL")
+                .is_none_or(|value| value != "0");
+        let implementation = if force_full_kernel || large_vision_stem {
+            Conv2dImpl::FullIm2Col
+        } else {
+            match std::env::var("CANDLE_CPU_CONV2D_IMPL").ok().as_deref() {
+                Some("full") => Conv2dImpl::FullIm2Col,
+                Some("direct") => Conv2dImpl::Direct,
+                _ => DEFAULT_CONV2D_IMPL,
+            }
+        };
+        match implementation {
             Conv2dImpl::TiledIm2Col => conv2d_tiled(p, inp, inp_l, k, k_l),
             Conv2dImpl::Direct => conv2d_direct(p, inp, inp_l, k, k_l),
             Conv2dImpl::FullIm2Col => conv2d_im2col_gemm(p, inp, inp_l, k, k_l),
         }
     }
+}
+
+fn conv2d_depthwise_direct<T: WithDType + num_traits::Num + Copy + Send + Sync + 'static>(
+    p: &ParamsConv2D,
+    inp: &[T],
+    inp_l: &Layout,
+    k: &[T],
+    k_l: &Layout,
+) -> Result<Vec<T>> {
+    let inp = &inp[inp_l.start_offset()..];
+    let (inp_s0, inp_s1, inp_s2, inp_s3) = dims4(inp_l.stride())?;
+    let k = &k[k_l.start_offset()..];
+    let (k_s0, _k_s1, k_s2, k_s3) = dims4(k_l.stride())?;
+    if k_l.dims() != [p.c_out, 1, p.k_h, p.k_w] {
+        crate::bail!(
+            "native depthwise conv expected weights [{}, 1, {}, {}], got {:?}",
+            p.c_out,
+            p.k_h,
+            p.k_w,
+            k_l.dims()
+        )
+    }
+    let out_h = p.out_h();
+    let out_w = p.out_w();
+    let out_pixels = out_h * out_w;
+    let mut output = vec![T::zero(); p.b_size * p.c_out * out_pixels];
+    let spatial_rows = p.stride == 1
+        && p.dilation == 1
+        && out_h == p.i_h
+        && out_w == p.i_w
+        && inp_s3 == 1
+        && k_s3 == 1
+        && std::env::var_os("CANDLE_CPU_DEPTHWISE_SPATIAL_ROWS").is_none_or(|value| value != "0");
+    if spatial_rows {
+        // Keep one channel plane per Rayon task, but traverse each valid
+        // contiguous spatial row once per kernel tap. The prior output-pixel
+        // loop repeated padding checks in its innermost kernel and exposed
+        // only a scalar reduction. This order preserves every output's
+        // kernel accumulation order while making the pixel update a simple
+        // contiguous AXPY loop that LLVM can vectorize. It uses the final
+        // output directly and allocates no im2col or per-worker scratch.
+        output
+            .par_chunks_mut(out_pixels)
+            .enumerate()
+            .for_each(|(batch_channel, output)| {
+                let batch = batch_channel / p.c_out;
+                let channel = batch_channel % p.c_out;
+                let input_base = batch * inp_s0 + channel * inp_s1;
+                let weight_base = channel * k_s0;
+                for kernel_y in 0..p.k_h {
+                    let out_y_start = p.padding.saturating_sub(kernel_y);
+                    let out_y_end = (p.i_h + p.padding).saturating_sub(kernel_y).min(out_h);
+                    for kernel_x in 0..p.k_w {
+                        let out_x_start = p.padding.saturating_sub(kernel_x);
+                        let out_x_end = (p.i_w + p.padding).saturating_sub(kernel_x).min(out_w);
+                        if out_x_start >= out_x_end {
+                            continue;
+                        }
+                        let weight = k[weight_base + kernel_y * k_s2 + kernel_x];
+                        for out_y in out_y_start..out_y_end {
+                            let input_y = out_y + kernel_y - p.padding;
+                            let input_x = out_x_start + kernel_x - p.padding;
+                            let input_start = input_base + input_y * inp_s2 + input_x;
+                            let width = out_x_end - out_x_start;
+                            let input_row = &inp[input_start..input_start + width];
+                            let output_row =
+                                &mut output[out_y * out_w + out_x_start..out_y * out_w + out_x_end];
+                            for (output, input) in output_row.iter_mut().zip(input_row) {
+                                *output = *output + *input * weight;
+                            }
+                        }
+                    }
+                }
+            });
+        return Ok(output);
+    }
+    output
+        .par_chunks_mut(out_pixels)
+        .enumerate()
+        .for_each(|(batch_channel, output)| {
+            let batch = batch_channel / p.c_out;
+            let channel = batch_channel % p.c_out;
+            let input_base = batch * inp_s0 + channel * inp_s1;
+            let weight_base = channel * k_s0;
+            for out_y in 0..out_h {
+                for out_x in 0..out_w {
+                    let mut sum = T::zero();
+                    for kernel_y in 0..p.k_h {
+                        let input_y = (out_y * p.stride + kernel_y * p.dilation) as isize
+                            - p.padding as isize;
+                        if !(0..p.i_h as isize).contains(&input_y) {
+                            continue;
+                        }
+                        for kernel_x in 0..p.k_w {
+                            let input_x = (out_x * p.stride + kernel_x * p.dilation) as isize
+                                - p.padding as isize;
+                            if !(0..p.i_w as isize).contains(&input_x) {
+                                continue;
+                            }
+                            let input_index =
+                                input_base + input_y as usize * inp_s2 + input_x as usize * inp_s3;
+                            let weight_index = weight_base + kernel_y * k_s2 + kernel_x * k_s3;
+                            sum = sum + inp[input_index] * k[weight_index];
+                        }
+                    }
+                    output[out_y * out_w + out_x] = sum;
+                }
+            }
+        });
+    Ok(output)
 }
 
 /// Fast kernel for 1x1 convolutions with stride=1, padding=0, dilation=1
@@ -213,27 +362,34 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
     // Higher tile size can be faster due to better usage of gemm,
     // but lower tile sizes enable bigger parallelism across tiles.
     // This parameter is impactful and may be dynamic or even runtime tunable in the future.
-    const TILE_SIZE: usize = 512;
+    const DEFAULT_TILE_SIZE: usize = 512;
+    // Attribution control for large image convolutions. Keep the portable
+    // default; valid values are bounded to avoid unreasonably large im2col
+    // scratch allocations.
+    let tile_size = std::env::var("CANDLE_CPU_CONV2D_TILE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| (128..=4096).contains(&value) && value.is_power_of_two())
+        .unwrap_or(DEFAULT_TILE_SIZE);
 
     let total_out_pixels = out_h * out_w;
     let use_same3_interior_fast_path =
         p.k_h == 3 && p.k_w == 3 && p.stride == 1 && p.padding == 1 && p.dilation == 1;
-
     // Process batches and tiles in parallel using rayon.
     (0..p.b_size).into_par_iter().try_for_each(|b_idx| {
         let inp_offset = b_idx * inp_s0;
         let out_batch_offset = b_idx * (p.c_out * out_h * out_w);
 
-        let num_tiles = total_out_pixels.div_ceil(TILE_SIZE);
+        let num_tiles = total_out_pixels.div_ceil(tile_size);
         (0..num_tiles).into_par_iter().try_for_each(|tile_idx| {
             // Determine actual tile size (may be smaller at the end) {
-            let tile_start = tile_idx * TILE_SIZE;
-            let tile_end = (tile_start + TILE_SIZE).min(total_out_pixels);
-            let tile_size = tile_end - tile_start;
+            let tile_start = tile_idx * tile_size;
+            let tile_end = (tile_start + tile_size).min(total_out_pixels);
+            let current_tile_size = tile_end - tile_start;
 
             // Build im2col tile: [k_size, tile_size]
             // This represents the input patches needed for this tile of outputs
-            let mut col_tile = vec![T::zero(); k_size * tile_size];
+            let mut col_tile = vec![T::zero(); k_size * current_tile_size];
 
             for (tile_idx, out_idx) in (tile_start..tile_end).enumerate() {
                 let out_y = out_idx / out_w;
@@ -252,7 +408,7 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
                                 + (out_x - 1) * inp_s3;
                             for kw in 0..3 {
                                 let patch_offset = c_in + (kh * 3 + kw) * p.c_in;
-                                let col_idx = patch_offset * tile_size + tile_idx;
+                                let col_idx = patch_offset * current_tile_size + tile_idx;
                                 col_tile[col_idx] = inp[inp_base + kw * inp_s3];
                             }
                         }
@@ -279,7 +435,7 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
                                 let in_x = in_x as usize;
                                 let inp_idx =
                                     inp_offset + c_in * inp_s1 + in_y * inp_s2 + in_x * inp_s3;
-                                let col_idx = patch_offset * tile_size + tile_idx;
+                                let col_idx = patch_offset * current_tile_size + tile_idx;
                                 col_tile[col_idx] = inp[inp_idx];
                             }
                             // Move to next position (skip c_in channels)
@@ -290,12 +446,12 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
             }
 
             // Now perform matmul: k_cache [c_out, k_size] @ col_tile [k_size, tile_size]
-            let matmul = MatMul((1, p.c_out, tile_size, k_size));
+            let matmul = MatMul((1, p.c_out, current_tile_size, k_size));
 
             // Layouts for matmul
             // k_flat layout: [c_out, k_size] with stride [k_size, 1]
             // col_tile layout: [k_size, tile_size] with stride [tile_size, 1]
-            let col_layout = Layout::contiguous((k_size, tile_size));
+            let col_layout = Layout::contiguous((k_size, current_tile_size));
 
             // Perform matmul
             let result = matmul.f(&k_flat, &k_layout, &col_tile, &col_layout)?;
@@ -308,7 +464,7 @@ fn conv2d_tiled<T: WithDType + num_traits::Num + Copy + 'static>(
 
                 for c_out_idx in 0..p.c_out {
                     let dst_idx = dst_base + c_out_idx * (out_h * out_w);
-                    let result_idx = c_out_idx * tile_size + tile_idx;
+                    let result_idx = c_out_idx * current_tile_size + tile_idx;
                     // SAFETY: Each batch processes a distinct region of the output buffer.
                     // Within each batch, tiles process non-overlapping output positions.
                     // Therefore, no two threads will write to the same dst_idx.
