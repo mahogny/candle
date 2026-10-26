@@ -48,3 +48,6 @@ bria.mp3
 bria.safetensors
 bria.wav
 bench_results/
+
+# Local upstream GEMM working checkout; the build uses its pinned git revision.
+/vendor/gemm/

@@ -63,7 +63,8 @@ cudarc = { version = "0.19.8", features = [
 fancy-regex = "0.18.0"
 # Local upstream v0.19.0 fork. It is byte-for-byte the released dependency
 # until the reusable packed-RHS extension below is added.
-gemm = { version = "0.19.0", path = "./vendor/gemm/gemm", features = ["wasm-simd128-enable", "x86-v4"] }
+# Keep the CPU tuning controls without depending on an untracked vendor checkout.
+gemm = { git = "https://github.com/henriksson-lab/gemm.git", rev = "a9ea398a74911f4a0cc79261044cbdf4ce9efd91", features = ["wasm-simd128-enable", "x86-v4"] }
 hf-hub = "0.5.0"
 half = { version = "2.5.0", features = [
     "num-traits",
